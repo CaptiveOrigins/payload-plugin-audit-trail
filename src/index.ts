@@ -66,7 +66,7 @@ export type AuditTrailOptions = {
   /** Seals stop this many minutes before now, so transactions still open land in the next seal. Default 10. */
   sealGraceMinutes?: number
   /** Called after each seal: copy the digest somewhere the database's writers can't reach (a log, an email). */
-  onSeal?: (seal: { digest: string; upTo: string; count: number; kind: 'seal' | 'checkpoint' }) => void | Promise<void>
+  onSeal?: (seal: { digest: string; upTo: string; count: number; kind: 'seal' | 'checkpoint' | 'adoption' }) => void | Promise<void>
 }
 
 export type AuditEntry = {
@@ -249,7 +249,7 @@ export function fromPluginEvent<E>(mapper: (event: E) => AuditEntry | null | Pro
 }
 
 type Entry = Record<string, any> & { id: string | number; at: string; hash: string; prevHash?: string | null; seq: number; chainKey: string }
-type Seal = { id: string | number; kind: 'seal' | 'checkpoint'; seq: number; prevDigest?: string | null; digest: string; fromAt?: string | null; upTo: string; count: number }
+type Seal = { id: string | number; kind: 'seal' | 'checkpoint' | 'adoption'; seq: number; prevDigest?: string | null; digest: string; fromAt?: string | null; upTo: string; count: number }
 
 const allSorted = async (payload: Payload, slug: string, where: Record<string, unknown> = {}, sort: string[] = ['at', 'id']) =>
   (await payload.find({ collection: slug as never, where: where as never, sort, limit: 0, pagination: false, depth: 0, overrideAccess: true, showHiddenFields: true })).docs as unknown as Record<string, any>[]
@@ -298,9 +298,44 @@ export async function sealAuditTrail(payload: Payload, args: { now?: Date; upTo?
   return writeSeal(payload, o, async (last) => {
     if (last && last.upTo >= upTo) return null
     const from = last?.upTo ?? null
-    const entries = await allSorted(payload, o.slug, { and: [{ at: { less_than_equal: upTo } }, ...(from ? [{ at: { greater_than: from } }] : [])] })
+    // Entries from before chaining have no hash: the adoption seal covers them, never a regular one.
+    const entries = await allSorted(payload, o.slug, { and: [{ at: { less_than_equal: upTo } }, { hash: { exists: true } }, ...(from ? [{ at: { greater_than: from } }] : [])] })
     return { kind: 'seal', fromAt: from, upTo, count: entries.length, digest: sealDigest(last?.digest ?? null, entries.map((e) => String(e.hash)), upTo) }
   })
+}
+
+/** What an adopted (pre-chain) entry's digest covers: everything but its id, the chain fields and its values. */
+const CHAIN_FIELDS = new Set(['id', 'chainKey', 'seq', 'prevHash', 'prevAt', 'hash', 'valuesHash', 'values'])
+const adoptedHash = (e: Record<string, unknown>) => valuesHash(Object.fromEntries(Object.entries(e).filter(([k]) => !CHAIN_FIELDS.has(k))))
+
+/**
+ * For a site that kept an audit log before this plugin: run once, as a script, after switching. It seals every
+ * entry that has no hash (written before chaining), up to the newest of them, into one "adoption" seal in the seal
+ * chain, so that history is tamper-evident from now on. Verify then accepts unhashed entries only inside that
+ * seal, and treats any written after it as a break (something wrote around the plugin). Logged values aren't
+ * covered, so clearing them by age stays possible.
+ *
+ * Safe to run again: with an adoption already made, it does nothing if there's nothing new, and refuses if
+ * unhashed entries appeared after it, since that's a break to look at, not history to adopt.
+ */
+export async function adoptExistingEntries(payload: Payload): Promise<{ adopted: number; upTo: string | null }> {
+  const o = optionsOf(payload)
+  const unhashed = (await allSorted(payload, o.slug, { or: [{ hash: { exists: false } }, { hash: { equals: null } }] })) as Record<string, any>[]
+  const seals = (await allSorted(payload, o.seals, { kind: { equals: 'adoption' } }, ['seq'])) as unknown as Seal[]
+  const adoption = seals[0] ?? null
+  if (adoption) {
+    const after = unhashed.filter((e) => new Date(e.at).toISOString() > adoption.upTo)
+    if (after.length) throw new Error(`audit-trail: ${after.length} unhashed entr${after.length === 1 ? 'y was' : 'ies were'} written after the adoption seal. That's a break, not history: run verifyAuditTrail and look into it.`)
+    return { adopted: 0, upTo: adoption.upTo }
+  }
+  if (!unhashed.length) return { adopted: 0, upTo: null }
+  // After a prune, an adoption may have existed and been cut away: unhashed entries now can only be a break.
+  const checkpoints = await allSorted(payload, o.seals, { kind: { equals: 'checkpoint' } })
+  if (checkpoints.length) throw new Error('audit-trail: the trail has been pruned, so unhashed entries now are a break, not history to adopt. Run verifyAuditTrail and look into them.')
+  const upTo = new Date(unhashed.at(-1)!.at).toISOString()
+  const done = await writeSeal(payload, o, async (last) => ({ kind: 'adoption', fromAt: null, upTo, count: unhashed.length, digest: sealDigest(last?.digest ?? null, unhashed.map(adoptedHash), upTo, 'adoption') }))
+  if (!done) throw new Error('audit-trail: a seal ran at the same moment; run the adoption again.')
+  return { adopted: unhashed.length, upTo }
 }
 
 /**
@@ -326,9 +361,14 @@ export async function pruneAuditTrail(payload: Payload, args: { olderThanDays?: 
       const cut = new Date(boundary.upTo).toISOString()
       const checkpoint = await writeSeal(payload, o, async (last) => ({ kind: 'checkpoint', fromAt: null, upTo: cut, count: 0, digest: sealDigest(last?.digest ?? null, [], cut, 'checkpoint') }))
       if (!checkpoint) throw new Error('audit-trail: a seal ran at the same moment; prune again.')
-      const r = await payload.delete({ collection: o.slug as never, where: { at: { less_than_equal: cut } } as never, overrideAccess: true })
+      // Adopted entries go only once the cut passes the whole adoption, so its digest can still be checked until then.
+      const adoption = (await allSorted(payload, o.seals, { kind: { equals: 'adoption' } }))[0] as Seal | undefined
+      const keepAdopted = adoption && new Date(adoption.upTo).toISOString() > cut
+      const r = await payload.delete({ collection: o.slug as never, where: { and: [{ at: { less_than_equal: cut } }, ...(keepAdopted ? [{ hash: { exists: true } }] : [])] } as never, overrideAccess: true })
       deleted = r.docs.length
       await payload.db.deleteMany({ collection: o.seals, where: { and: [{ kind: { equals: 'seal' } }, { upTo: { less_than_equal: cut } }] } as never })
+      // Its entries are gone, so the adoption seal goes too, like the seals before the cut; the checkpoint records it.
+      if (adoption && !keepAdopted) await payload.db.deleteMany({ collection: o.seals, where: { kind: { equals: 'adoption' } } as never })
     }
   }
   return { valuesCleared, deleted }
@@ -346,9 +386,17 @@ export async function verifyAuditTrail(payload: Payload, args: { since?: Date; n
   const now = args.now ?? new Date()
   const warnings: string[] = []
   const fail = (id: unknown, reason: string, checked: number): VerifyResult => ({ ok: false, checked, firstBreak: { id: String(id), reason }, warnings })
-  const entries = (await allSorted(payload, o.slug, {}, ['chainKey', 'seq'])) as Entry[]
+  const all = (await allSorted(payload, o.slug, {}, ['chainKey', 'seq'])) as Entry[]
   const seals = (await allSorted(payload, o.seals, {}, ['seq'])) as unknown as Seal[]
   const checkpoint = [...seals].reverse().find((s) => s.kind === 'checkpoint') ?? null
+  // Entries with no hash were written before chaining. They're allowed only inside the adoption seal's range.
+  const adoption = seals.find((s) => s.kind === 'adoption') ?? null
+  const entries = all.filter((e) => e.hash)
+  const unhashed = all.filter((e) => !e.hash).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : String(a.id) < String(b.id) ? -1 : 1)) as Record<string, any>[]
+  for (const e of unhashed) {
+    if (!adoption) return fail(e.id, 'an entry has no hash and there is no adoption seal (it was written outside the plugin, or adoptExistingEntries hasn\u2019t run)', 0)
+    if (new Date(e.at).toISOString() > adoption.upTo) return fail(e.id, 'an entry has no hash and was written after the adoption seal (something wrote around the plugin)', 0)
+  }
   const since = args.since?.toISOString()
   let checked = 0
   // 1. Each record's chain: hashes, links, no gaps.
@@ -387,6 +435,13 @@ export async function verifyAuditTrail(payload: Payload, args: { since?: Date; n
     if (prevSeal && s.prevDigest !== prevSeal.digest) return fail(s.id, 'a seal doesn’t link to the seal before it', checked)
     if (s.kind === 'checkpoint') {
       if (sealDigest(s.prevDigest ?? null, [], s.upTo, 'checkpoint') !== s.digest) return fail(s.id, 'a checkpoint was changed', checked)
+    } else if (s.kind === 'adoption') {
+      // Once a checkpoint cut past the whole adoption, its entries are gone by design and only the link is checked.
+      const prunedPast = checkpoint && checkpoint.upTo >= new Date(s.upTo).toISOString()
+      if (prunedPast) {
+        if (unhashed.length) return fail(unhashed[0]!.id, 'an adopted entry is still here after the cut that should have removed it', checked)
+      } else if (unhashed.length !== s.count || sealDigest(s.prevDigest ?? null, unhashed.map(adoptedHash), new Date(s.upTo).toISOString(), 'adoption') !== s.digest)
+        return fail(s.id, 'entries from before chaining were added, removed or changed since they were adopted', checked)
     } else {
       const inRange = entries.filter((e) => e.at <= s.upTo && (!s.fromAt || e.at > s.fromAt)).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : String(a.id) < String(b.id) ? -1 : 1))
       if (inRange.length !== s.count || sealDigest(s.prevDigest ?? null, inRange.map((e) => e.hash), s.upTo) !== s.digest) return fail(s.id, 'entries in a sealed range were added, removed, reordered or changed', checked)
@@ -427,7 +482,7 @@ function chainCollections(o: Resolved): CollectionConfig[] {
       admin: { hidden: true },
       access: { read: nobody, create: nobody, update: nobody, delete: nobody },
       fields: [
-        { name: 'kind', type: 'select', required: true, options: ['seal', 'checkpoint'] },
+        { name: 'kind', type: 'select', required: true, options: ['seal', 'checkpoint', 'adoption'] },
         { name: 'seq', type: 'number', required: true, index: true },
         { name: 'prevDigest', type: 'text' },
         { name: 'digest', type: 'text', required: true },

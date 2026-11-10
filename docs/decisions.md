@@ -20,3 +20,5 @@ Dated decisions for this repo, newest last.
 - D8 Seed World: the collections this plugin adds were sent to Seed World ahead of the site wiring (2026-11-10). Platform's wiring PR sends the at-merge notice.
 - D12 no family tags yet: `compliance` (a draft family name) removed from the keywords before the first publish; the categories stay `security` and `privacy`.
 - D9, D10, D11, D13, D14, D15, D16: don't apply to this repo.
+
+- 2026-11-10 (Plugins Lead, K26): `adoptExistingEntries`, as Web Platform asked for the Captive Origins switch. One adoption seal in the seal chain covers every unhashed entry by content (not values), so pre-chain history is tamper-evident from the cutover on. Unhashed entries after it are breaks. Adoption is allowed after regular seals (the site's seal job may run before the script), but refused once the trail has been pruned. Built on branch `adopt-existing`, merging after its security read, so the owner's first publish (N99) includes it.

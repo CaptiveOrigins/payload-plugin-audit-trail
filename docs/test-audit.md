@@ -28,3 +28,17 @@ Each promise in the README and ADR 0001, and the test that proves it:
 | Hash stable on read back; missing equals null; extra fields added later | "the hash itself" |
 
 Gaps, skipped with reason: Postgres (not supported in 0.1, said in Limits); a verify over a very large trail (`since` exists, a scale test belongs to the site).
+
+## 2026-11-10: adopting a log kept before the plugin (K26)
+
+| Promise | Test |
+| --- | --- |
+| Verify fails before adoption and passes after; later entries are sealed around the adopted ones | `adopt > fails verify before adoption…` |
+| A second run does nothing; an empty trail adopts nothing | `adopt > does nothing on a second run…` |
+| Editing, deleting or adding an adopted-range entry breaks verify | `adopt > breaks when an adopted entry is changed…` |
+| An unhashed entry after the adoption breaks verify and can't be adopted | `adopt > breaks on an unhashed entry written after…` |
+| Clearing logged values by age keeps adopted entries valid | `adopt > keeps logged values out…` |
+| Regular seals leave unhashed entries out; a prune cutting inside the adoption keeps adopted entries | `adopt > keeps unhashed entries out of a regular seal…` |
+| A prune past the adoption removes adopted entries and the adoption seal; adopting after a prune is refused | `adopt > keeps adopted entries through a prune…` |
+
+Gaps added: the seven tests above. A mutation check catches all 7 guards (two were caught only after the sixth test was added).

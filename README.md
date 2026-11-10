@@ -2,7 +2,7 @@
 
 A tamper-evident audit trail for Payload: who changed which fields of which record, from where and through whom, never the values. Each record's entries are hash-chained, a seal chains them across the site, and a verify reports the first break.
 
-**Status:** early, 0.1.0, not on npm yet. 25 tests pass against a real Payload 3.92 with an in-memory MongoDB (a replica set). They cover what's recorded, failing closed with and without transactions, the value log and its startup refusals, read access, drafts, autosave and restores, the sink for other plugins, retention, and the chain: 40 changes at once without a fork, two seals at once, and tampering caught each way (an entry edited, the newest deleted, one removed or forged, a whole record's chain deleted after a seal, values edited, the first entry after a prune deleted). It isn't in use on any site yet.
+**Status:** early, 0.1.0, not on npm yet. 32 tests pass against a real Payload 3.92 with an in-memory MongoDB (a replica set). They cover what's recorded, failing closed with and without transactions, the value log and its startup refusals, read access, drafts, autosave and restores, the sink for other plugins, retention, and the chain: 40 changes at once without a fork, two seals at once, and tampering caught each way (an entry edited, the newest deleted, one removed or forged, a whole record's chain deleted after a seal, values edited, the first entry after a prune deleted), and adopting a log kept before the plugin (verify after it, each kind of tampering with adopted entries, entries written around the plugin, running it twice, and pruning). It isn't in use on any site yet.
 
 ## What it does
 
@@ -49,6 +49,16 @@ export default buildConfig({
 - **`access.values` must be at least as strict as reading the records themselves.** On a multi-site install, `access.read` must filter by site.
 - **Writes that skip Payload** (`payload.db.*`, or a database client) aren't recorded, and neither is the plugin's own bookkeeping.
 - **Drafts:** a draft autosave of a record isn't recorded; publishing and saving are, and so is any other record a hook changes during an autosave. An autosave flag on a collection without drafts, or on a non-draft save, doesn't skip anything. Restoring a version is recorded as an update with `restored version <id>` as its reason.
+
+## Switching from your own audit log
+
+If the collection already holds entries written before this plugin, they have no hash, and verify reports each one as a break. Run `adoptExistingEntries(payload)` once, as a script, after switching:
+
+- It writes an "adoption" seal into the seal chain. The seal's digest covers every unhashed entry up to the newest of them, by its content (everything but the chain fields and the logged values, so clearing values by age still works).
+- From then on, verify checks those entries against the digest. Editing, deleting or adding one within that range is a break. An unhashed entry dated after the adoption is a break too, because something wrote around the plugin.
+- Running it again does nothing. It refuses if unhashed entries appeared after the adoption, or if the trail has been pruned since, because then they can only be a break.
+- Pruning keeps adopted entries until a cut passes all of them, then removes them with the adoption seal, and the checkpoint records the cut.
+- What the old entries said before the adoption can't be proven: the seal makes them tamper-evident only from the moment it's written. Copy its digest out with `onSeal`, as with any seal.
 
 ## Limits
 
