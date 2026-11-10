@@ -13,7 +13,6 @@
     "audit-log",
     "tamper-evident",
     "hash-chain",
-    "compliance",
     "provenance"
   ],
   "license": "MIT",
