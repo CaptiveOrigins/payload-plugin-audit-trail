@@ -1,0 +1,8 @@
+.DS_Store
+.env
+.secrets/
+build/
+dist/
+node_modules/
+.build/
+.gradle/

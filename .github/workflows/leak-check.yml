@@ -1,0 +1,24 @@
+name: Leak check
+
+# Every change, docs included (rules/actions-minutes.md, 2026-11-10). The build skips docs-only changes, and
+# README or docs text is where a stray email address most often slips in. A few seconds, no build tools.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  leak-check:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/leak-check.sh

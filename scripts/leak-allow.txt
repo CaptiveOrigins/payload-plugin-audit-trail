@@ -1,0 +1,2 @@
+# Public phrases this repo shows on purpose (one per line). Keep it short.
+EXTANT APE
