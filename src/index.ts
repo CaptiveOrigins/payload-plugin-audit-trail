@@ -170,9 +170,10 @@ async function write(payload: Payload, o: Resolved, entry: AuditEntry, values?: 
         const seq = (head?.seq ?? 0) + 1
         const prevHash = head?.hash ?? null
         const prevAt = head?.at ? new Date(head.at).toISOString() : null
-        const hash = entryHash({ ...base, chainKey, seq, prevHash, prevAt, extra })
+        const vh = hasValues ? valuesHash(values) : null
+        const hash = entryHash({ ...base, chainKey, seq, prevHash, prevAt, extra, valuesHash: vh })
         if (!(await moveHead(payload, o.heads, chainKey, head, { hash, seq, at: base.at }, r))) continue
-        const data = { ...base, ...(base.via ? {} : { via: undefined }), ...extra, chainKey, seq, prevHash, prevAt, hash, ...(hasValues ? { values, valuesHash: valuesHash(values) } : {}) }
+        const data = { ...base, ...(base.via ? {} : { via: undefined }), ...extra, chainKey, seq, prevHash, prevAt, hash, ...(hasValues ? { values, valuesHash: vh } : {}) }
         await payload.create({ collection: o.slug as never, data: data as never, overrideAccess: true, ...(r ? { req: r } : {}) })
         if (own) await payload.db.commitTransaction(own)
         return
@@ -251,17 +252,17 @@ export function fromPluginEvent<E>(mapper: (event: E) => AuditEntry | null | Pro
 type Entry = Record<string, any> & { id: string | number; at: string; hash: string; prevHash?: string | null; seq: number; chainKey: string }
 type Seal = { id: string | number; kind: 'seal' | 'checkpoint' | 'adoption'; seq: number; prevDigest?: string | null; digest: string; fromAt?: string | null; upTo: string; count: number }
 
-const allSorted = async (payload: Payload, slug: string, where: Record<string, unknown> = {}, sort: string[] = ['at', 'id']) =>
-  (await payload.find({ collection: slug as never, where: where as never, sort, limit: 0, pagination: false, depth: 0, overrideAccess: true, showHiddenFields: true })).docs as unknown as Record<string, any>[]
+const allSorted = async (payload: Payload, slug: string, where: Record<string, unknown> = {}, sort: string[] = ['at', 'id'], req?: PayloadRequest) =>
+  (await payload.find({ collection: slug as never, where: where as never, sort, limit: 0, pagination: false, depth: 0, overrideAccess: true, showHiddenFields: true, ...(req ? { req } : {}) })).docs as unknown as Record<string, any>[]
 
 /** Writes a seal (or checkpoint) and moves the seal head conditionally, in one transaction when there is one. Null when another seal won. */
-async function writeSeal(payload: Payload, o: Resolved, build: (last: Seal | null) => Promise<Omit<Seal, 'id' | 'seq' | 'prevDigest'> | null>) {
+async function writeSeal(payload: Payload, o: Resolved, build: (last: Seal | null, req?: PayloadRequest) => Promise<Omit<Seal, 'id' | 'seq' | 'prevDigest'> | null>) {
   const id = (await payload.db.beginTransaction?.()) ?? undefined
   const req = id ? ({ payload, transactionID: id } as unknown as PayloadRequest) : undefined
   try {
     const head = await readHead(payload, o.heads, SEAL_KEY, req)
     const last = head ? ((await allSorted(payload, o.seals, { seq: { equals: head.seq } }))[0] as Seal | undefined) ?? null : null
-    const seal = await build(last)
+    const seal = await build(last, req)
     if (!seal) {
       if (id) await payload.db.rollbackTransaction(id)
       return null
@@ -296,46 +297,65 @@ export async function sealAuditTrail(payload: Payload, args: { now?: Date; upTo?
   if (args.upTo && args.upTo.getTime() > latest.getTime()) throw new Error(`audit-trail: a seal can't reach closer than ${o.sealGraceMinutes} minutes to now (transactions may still be open).`)
   const upTo = (args.upTo ?? latest).toISOString()
   return writeSeal(payload, o, async (last) => {
-    if (last && last.upTo >= upTo) return null
-    const from = last?.upTo ?? null
+    // Continue from the newest end of any seal, not just the last one written: an adoption or a checkpoint can end
+    // earlier than a seal before it, and starting there would seal the same entries twice.
+    const newest = (await allSorted(payload, o.seals, {}, ['-upTo']))[0] as Seal | undefined
+    const from = newest ? new Date(newest.upTo).toISOString() : null
+    if ((from && from >= upTo) || (last && new Date(last.upTo).toISOString() >= upTo)) return null
     // Entries from before chaining have no hash: the adoption seal covers them, never a regular one.
     const entries = await allSorted(payload, o.slug, { and: [{ at: { less_than_equal: upTo } }, { hash: { exists: true } }, ...(from ? [{ at: { greater_than: from } }] : [])] })
     return { kind: 'seal', fromAt: from, upTo, count: entries.length, digest: sealDigest(last?.digest ?? null, entries.map((e) => String(e.hash)), upTo) }
   })
 }
 
-/** What an adopted (pre-chain) entry's digest covers: everything but its id, the chain fields and its values. */
-const CHAIN_FIELDS = new Set(['id', 'chainKey', 'seq', 'prevHash', 'prevAt', 'hash', 'valuesHash', 'values'])
+/** What an adopted (pre-chain) entry's digest covers: everything but its id, the chain fields and its values (whose own hash is covered). */
+const CHAIN_FIELDS = new Set(['id', 'chainKey', 'seq', 'prevHash', 'prevAt', 'hash', 'values'])
 const adoptedHash = (e: Record<string, unknown>) => valuesHash(Object.fromEntries(Object.entries(e).filter(([k]) => !CHAIN_FIELDS.has(k))))
+const unhashedWhere = { or: [{ hash: { exists: false } }, { hash: { equals: null } }, { hash: { equals: '' } }] }
 
 /**
  * For a site that kept an audit log before this plugin: run once, as a script, after switching. It seals every
  * entry that has no hash (written before chaining), up to the newest of them, into one "adoption" seal in the seal
- * chain, so that history is tamper-evident from now on. Verify then accepts unhashed entries only inside that
- * seal, and treats any written after it as a break (something wrote around the plugin). Logged values aren't
- * covered, so clearing them by age stays possible.
+ * chain, so that history is tamper-evident from now on. Each adopted entry's logged values get their own hash
+ * first, and the digest covers it: values can still be cleared by age, but not edited. Verify then accepts
+ * unhashed entries only inside that seal, and treats any written after it as a break.
  *
  * Safe to run again: with an adoption already made, it does nothing if there's nothing new, and refuses if
- * unhashed entries appeared after it, since that's a break to look at, not history to adopt.
+ * unhashed entries appeared after it. It refuses once the trail has been pruned at all, since an adoption may have
+ * been cut away and unhashed entries can then only be a break. Everything is read inside the seal's own
+ * transaction, so a seal or prune at the same moment can't slip between the check and the write.
  */
 export async function adoptExistingEntries(payload: Payload): Promise<{ adopted: number; upTo: string | null }> {
   const o = optionsOf(payload)
-  const unhashed = (await allSorted(payload, o.slug, { or: [{ hash: { exists: false } }, { hash: { equals: null } }] })) as Record<string, any>[]
-  const seals = (await allSorted(payload, o.seals, { kind: { equals: 'adoption' } }, ['seq'])) as unknown as Seal[]
-  const adoption = seals[0] ?? null
-  if (adoption) {
-    const after = unhashed.filter((e) => new Date(e.at).toISOString() > adoption.upTo)
-    if (after.length) throw new Error(`audit-trail: ${after.length} unhashed entr${after.length === 1 ? 'y was' : 'ies were'} written after the adoption seal. That's a break, not history: run verifyAuditTrail and look into it.`)
-    return { adopted: 0, upTo: adoption.upTo }
-  }
-  if (!unhashed.length) return { adopted: 0, upTo: null }
-  // After a prune, an adoption may have existed and been cut away: unhashed entries now can only be a break.
-  const checkpoints = await allSorted(payload, o.seals, { kind: { equals: 'checkpoint' } })
-  if (checkpoints.length) throw new Error('audit-trail: the trail has been pruned, so unhashed entries now are a break, not history to adopt. Run verifyAuditTrail and look into them.')
-  const upTo = new Date(unhashed.at(-1)!.at).toISOString()
-  const done = await writeSeal(payload, o, async (last) => ({ kind: 'adoption', fromAt: null, upTo, count: unhashed.length, digest: sealDigest(last?.digest ?? null, unhashed.map(adoptedHash), upTo, 'adoption') }))
-  if (!done) throw new Error('audit-trail: a seal ran at the same moment; run the adoption again.')
-  return { adopted: unhashed.length, upTo }
+  let result: { adopted: number; upTo: string | null } = { adopted: 0, upTo: null }
+  let refused: Error | null = null
+  const done = await writeSeal(payload, o, async (_last, req) => {
+    const read = (slug: string, where: Record<string, unknown>, sort?: string[]) => allSorted(payload, slug, where, sort, req)
+    const unhashed = (await read(o.slug, unhashedWhere)) as Record<string, any>[]
+    const adoption = ((await read(o.seals, { kind: { equals: 'adoption' } }, ['seq'])) as unknown as Seal[])[0] ?? null
+    if (adoption) {
+      const after = unhashed.filter((e) => new Date(e.at).toISOString() > new Date(adoption.upTo).toISOString())
+      if (after.length) refused = new Error(`audit-trail: ${after.length} unhashed entr${after.length === 1 ? 'y was' : 'ies were'} written after the adoption seal. That's a break, not history: run verifyAuditTrail and look into it.`)
+      result = { adopted: 0, upTo: new Date(adoption.upTo).toISOString() }
+      return null
+    }
+    if (!unhashed.length) return null
+    if ((await read(o.seals, { kind: { equals: 'checkpoint' } })).length) {
+      refused = new Error('audit-trail: the trail has been pruned, so unhashed entries now are a break, not history to adopt. Run verifyAuditTrail and look into them.')
+      return null
+    }
+    for (const e of unhashed)
+      if (e.values && !e.valuesHash) {
+        e.valuesHash = valuesHash(e.values)
+        await payload.db.updateOne({ collection: o.slug, where: { id: { equals: e.id } }, data: { valuesHash: e.valuesHash }, ...(req ? { req } : {}) } as never)
+      }
+    const upTo = new Date(unhashed.at(-1)!.at).toISOString()
+    result = { adopted: unhashed.length, upTo }
+    return { kind: 'adoption', fromAt: null, upTo, count: unhashed.length, digest: sealDigest(_last?.digest ?? null, unhashed.map(adoptedHash), upTo, 'adoption') }
+  })
+  if (refused) throw refused
+  if (result.adopted && !done) throw new Error('audit-trail: a seal ran at the same moment; run the adoption again.')
+  return result
 }
 
 /**
@@ -394,6 +414,7 @@ export async function verifyAuditTrail(payload: Payload, args: { since?: Date; n
   const entries = all.filter((e) => e.hash)
   const unhashed = all.filter((e) => !e.hash).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : String(a.id) < String(b.id) ? -1 : 1)) as Record<string, any>[]
   for (const e of unhashed) {
+    if (e.values && (!e.valuesHash || valuesHashOf(e.values) !== e.valuesHash)) return fail(e.id, 'its logged values were changed', 0)
     if (!adoption) return fail(e.id, 'an entry has no hash and there is no adoption seal (it was written outside the plugin, or adoptExistingEntries hasn\u2019t run)', 0)
     if (new Date(e.at).toISOString() > adoption.upTo) return fail(e.id, 'an entry has no hash and was written after the adoption seal (something wrote around the plugin)', 0)
   }

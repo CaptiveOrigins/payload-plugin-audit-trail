@@ -41,4 +41,9 @@ Gaps, skipped with reason: Postgres (not supported in 0.1, said in Limits); a ve
 | Regular seals leave unhashed entries out; a prune cutting inside the adoption keeps adopted entries | `adopt > keeps unhashed entries out of a regular seal…` |
 | A prune past the adoption removes adopted entries and the adoption seal; adopting after a prune is refused | `adopt > keeps adopted entries through a prune…` |
 
-Gaps added: the seven tests above. A mutation check catches all 7 guards (two were caught only after the sixth test was added).
+| A seal job before the script, then adoption, a later seal and a prune: nothing reported missing | `adopt > seals after an adoption continue…` |
+| Adopted entries' values: clearing is fine, editing or removing their hash is a break | `adopt > covers adopted entries' logged values…` |
+| A hashed entry's values hash is covered by its own hash | `adopt > a hashed entry's values hash…` |
+| An adoption seal left behind after a prune past it still makes leftover unhashed entries a break | `adopt > still checks unhashed entries…` |
+
+Gaps added: eleven tests in all; the last four after the security read of 0d94668 found the seal-continuation blocker, the values gap and the untested leftover check. A mutation check catches every guard but one: leaving the values hash out of the adoption digest survives, because verify's own values check on unhashed entries already catches the same edits. Gaps skipped: an adoption racing a prune isn't tested directly (its reads moved into the seal's transaction, whose head move decides the race, as for seals).

@@ -1,7 +1,7 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { buildConfig, getPayload, type Payload } from 'payload'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { adoptExistingEntries, auditTrail, pruneAuditTrail, sealAuditTrail, verifyAuditTrail } from '../src/index.js'
 
@@ -103,6 +103,62 @@ describe('adopting entries from before chaining', () => {
     await adoptExistingEntries(payload)
     await pruneAuditTrail(payload, { valuesOlderThanDays: 7 })
     expect(await verifyAuditTrail(payload)).toMatchObject({ ok: true })
+  })
+
+  it('seals after an adoption continue from the newest seal, so a later prune finds nothing missing (seal job before the script)', async () => {
+    await oldEntries(3, 400)
+    const t0 = Date.now()
+    await write('switched, before the script ran')
+    await sealAuditTrail(payload, { now: new Date(t0 + 60 * 60_000) }) // S0: the seal job runs first
+    await adoptExistingEntries(payload)
+    await write('later')
+    await sealAuditTrail(payload, { now: new Date(t0 + 2 * DAY) }) // S1 must start at S0's end, not the adoption's
+    const s1 = (await payload.find({ collection: 'audit-events-seals' as never, where: { kind: { equals: 'seal' } } as never, sort: '-seq', limit: 1, overrideAccess: true })).docs[0] as Doc
+    const s0 = (await payload.find({ collection: 'audit-events-seals' as never, where: { kind: { equals: 'seal' } } as never, sort: 'seq', limit: 1, overrideAccess: true })).docs[0] as Doc
+    expect(new Date(s1.fromAt).toISOString()).toBe(new Date(s0.upTo).toISOString())
+    // Prune at S0's end: S1's range is untouched.
+    await pruneAuditTrail(payload, { olderThanDays: 0, now: new Date(new Date(s0.upTo).getTime() + 1000) })
+    const r = await verifyAuditTrail(payload, { now: new Date(t0 + 2 * DAY) })
+    expect(r.firstBreak?.reason ?? null).toBeNull()
+  })
+
+  it('covers adopted entries’ logged values: clearing them is fine, editing or unhooking them is a break', async () => {
+    await oldEntries(2)
+    const events = raw()['audit-events']!.collection
+    await events.updateOne({ subjectId: 'note-0' }, { $set: { values: { text: { from: 'a', to: 'b' } } } })
+    await adoptExistingEntries(payload)
+    expect((await unhashed()).find((e) => e.subjectId === 'note-0')!.valuesHash).toBeTruthy()
+    await events.updateOne({ subjectId: 'note-0' }, { $set: { values: { text: { from: 'a', to: 'FORGED' } } } })
+    expect((await verifyAuditTrail(payload)).firstBreak?.reason).toMatch(/values were changed/)
+    await events.updateOne({ subjectId: 'note-0' }, { $set: { values: { text: { from: 'a', to: 'b' } } } })
+    expect((await verifyAuditTrail(payload)).ok).toBe(true)
+    await events.updateOne({ subjectId: 'note-0' }, { $unset: { valuesHash: '' } })
+    expect((await verifyAuditTrail(payload)).ok).toBe(false)
+  })
+
+  it('a hashed entry’s values hash is covered by its own hash: removing it to edit the values is a break', async () => {
+    const note = (await write('logged')) as Doc
+    void note
+    const [e] = (await payload.find({ collection: 'audit-events' as never, sort: '-at', limit: 1, depth: 0, overrideAccess: true, showHiddenFields: true })).docs as Doc[]
+    await raw()['audit-events']!.collection.updateOne({ hash: e!.hash }, { $set: { valuesHash: 'x' } })
+    expect((await verifyAuditTrail(payload)).ok).toBe(false)
+  })
+
+  it('still checks unhashed entries if an adoption seal was left behind after a prune past it', async () => {
+    await oldEntries(3, 400)
+    await write('switched')
+    const t0 = Date.now()
+    await sealAuditTrail(payload, { now: new Date(t0 + 60 * 60_000) })
+    await adoptExistingEntries(payload)
+    // A crash between the prune's deletes leaves the adoption seal behind.
+    const orig = payload.db.deleteMany.bind(payload.db)
+    const spy = vi.spyOn(payload.db, 'deleteMany').mockImplementation(((args: { where?: { kind?: { equals?: string } } }) => (args?.where?.kind?.equals === 'adoption' ? Promise.resolve() : orig(args as never))) as never)
+    const s0 = (await payload.find({ collection: 'audit-events-seals' as never, where: { kind: { equals: 'seal' } } as never, limit: 1, overrideAccess: true })).docs[0] as Doc
+    await pruneAuditTrail(payload, { olderThanDays: 0, now: new Date(new Date(s0.upTo).getTime() + 1000) })
+    spy.mockRestore()
+    expect(await unhashed()).toHaveLength(0)
+    await raw()['audit-events']!.collection.insertMany([{ at: new Date(Date.now() - 500 * DAY), action: 'update', subjectCollection: 'notes', subjectId: 'forged', origin: 'web' }])
+    expect((await verifyAuditTrail(payload)).firstBreak?.reason).toMatch(/still here after the cut/)
   })
 
   it('keeps unhashed entries out of a regular seal, and keeps adopted entries through a prune that cuts inside them', async () => {

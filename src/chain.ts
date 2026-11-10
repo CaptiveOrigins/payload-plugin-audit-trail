@@ -51,6 +51,8 @@ export type ChainFields = {
   /** When the previous entry in this chain was written: a chain left starting mid-way after a prune must have lost only entries from before the cut. */
   prevAt?: string | null
   extra?: Record<string, unknown>
+  /** The logged values' own hash: covered, so it can't be removed to unlock editing the values. */
+  valuesHash?: string | null
 }
 
 export function entryHash(e: ChainFields): string {
@@ -69,6 +71,7 @@ export function entryHash(e: ChainFields): string {
     seq: e.seq,
     prevAt: e.prevAt ? new Date(e.prevAt).toISOString() : null,
     extra: e.extra,
+    valuesHash: e.valuesHash ?? null,
   })
   return sha(`${e.prevHash ?? ''}\n${JSON.stringify(body)}`)
 }
