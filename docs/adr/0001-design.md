@@ -93,3 +93,29 @@ Platform read this ADR at `d3f2c8b`. Each point, and what changed:
 7. **Note.** The README says `context.audit.reason` is free text a developer writes and must never carry values; the plugin never fills it from data.
 
 Not changed: append-only access and the startup refusals. Platform agreed both are right.
+
+## Addendum: a tamper-evident trail (2026-11-10)
+
+The owner chose a hash-chained, tamper-evident trail (relayed by Platform, 2026-11-10; the exact words go in `docs/decisions.md` once Platform sends them). Platform listed five points to design in first, since the two-step races came from the same read-then-write pattern. The decisions:
+
+10. **Chains per record, sealed daily across the site.**
+    - Each entry joins the chain of its subject (`collection:id`). A small `audit-heads` document per subject holds that chain's last hash and a sequence number. The entry is written and the head moved in **one conditional update**, matched on the previous hash, **inside the change's own transaction**. If the head moved meanwhile, the plugin reads it again and retries a few times.
+    - Two changes to the same record at once already conflict in Payload, so this adds no new way to fail. Changes to different records never contend.
+    - **Why not one site-wide head per write:** in a transaction, two writers conflicting on one document makes one of them abort. That would make any two simultaneous edits on the site fail.
+    - Site-wide ordering comes from a **daily seal** instead. `sealAuditTrail(payload)`, from the site's daily job, takes the entries since the last seal, in order by time then id, up to a grace window (default 10 minutes ago, so transactions still open are left for the next seal). It writes a seal record: `digest = H(previous seal's digest, every entry hash in order)`, plus the count and the range.
+    - So within a sealed range an entry can't be added, removed or reordered unnoticed, and within a subject's chain no entry can be changed or dropped.
+    - Test: 40 changes at once (to one record and to many) give no fork, and verify passes.
+
+11. **Canonical form.** The hash covers a canonical JSON of the entry: keys sorted, dates as ISO strings, ids and relationship values as strings, missing values as null, `changedFields` sorted. It includes the site's `extraFields`. It never hashes Mongo's stored shape, so re-saving or reading back doesn't change it. Test: a document re-saved unchanged still verifies.
+
+12. **What retention may change.**
+    - `values` is **not** in the entry's hash. It has its own `valuesHash` in the entry, so clearing old values (retention) keeps the chain whole while still proving values existed. Verify checks `valuesHash` only where values are still present.
+    - **Deleting entries** (`olderThanDays`) cuts history at a recorded point. The prune first writes a **checkpoint seal** recording the last seal digest and the cut-off. Afterwards verify accepts each subject chain's oldest remaining link as its start, and checks seals from the checkpoint on.
+    - Tests: values cleared, then verify passes; entries pruned, then verify passes from the checkpoint.
+
+13. **Anchoring outside the database.** A chain only shows tampering if its head is also kept somewhere the database's writers can't reach. `onSeal({ digest, upTo, count })` is called after each seal, so the site can copy it out (a log line, an email to the owner, an object store). The README says plainly: without an anchor, anyone with write access to the database can rewrite the whole chain and every seal consistently.
+
+14. **Verifying.** `verifyAuditTrail(payload, { since? })` recomputes each entry's hash and its link to its subject's previous entry, then each seal's digest. It returns `{ ok, checked, firstBreak?: { id, reason } }`, reporting the first break and never guessing.
+    - Tests: an entry edited directly in the database (a field changed, a link changed, an entry deleted within a sealed range) is caught; untouched history passes.
+
+Choices left as stated: SHA-256, hex. `audit-heads` and seals are append-only (access false; only the plugin writes). With `onWriteError: 'log'`, a failed entry also leaves its chain untouched.
