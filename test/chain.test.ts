@@ -163,20 +163,24 @@ describe('seals', () => {
     await p.destroy()
   })
 
-  it('pruning old entries writes a checkpoint first, and what remains verifies', async () => {
+  it('pruning cuts at a seal’s end with a checkpoint; what remains verifies, and losing the first entry after the cut is caught', async () => {
     const p = await site()
     const a = await make(p, 'old')
-    await sealNow(p)
-    // Something newer than the cut, on the same record and a new one.
-    await raw(p, 'audit-events').updateMany({}, { $set: { at: new Date(Date.now() - 3 * 86_400_000) } })
-    await raw(p, 'audit-events-heads').updateMany({}, { $set: { at: new Date(Date.now() - 3 * 86_400_000) } })
-    // Those entries are now "three days old" (their hashes no longer match, but prune removes them all).
+    // Make that history "three days old" and seal it up to two days ago (its hashes no longer match; prune removes it).
+    const old = new Date(Date.now() - 3 * 86_400_000)
+    await raw(p, 'audit-events').updateMany({}, { $set: { at: old } })
+    await raw(p, 'audit-events-heads').updateMany({}, { $set: { at: old } })
+    await sealAuditTrail(p, { upTo: new Date(Date.now() - 2 * 86_400_000) })
     const r = await pruneAuditTrail(p, { olderThanDays: 1 })
     expect(r.deleted).toBeGreaterThan(0)
     await edit(p, a.id, { text: 'after the cut' })
+    await edit(p, a.id, { text: 'after the cut, again' })
     await make(p, 'new')
-    const v = await verifyAuditTrail(p)
-    expect(v).toMatchObject({ ok: true })
+    expect(await verifyAuditTrail(p)).toMatchObject({ ok: true })
+    // Deleting the first entry after the cut: the next one's previous entry isn't from before the cut.
+    const first = (await trail(p)).find((e) => e.chainKey === `notes:${a.id}`)!
+    await raw(p, 'audit-events').deleteOne({ hash: first.hash })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/start of/)
     await p.destroy()
   })
 })

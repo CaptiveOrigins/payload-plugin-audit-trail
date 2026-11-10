@@ -48,6 +48,8 @@ export type ChainFields = {
   chainKey: string
   seq: number
   prevHash?: string | null
+  /** When the previous entry in this chain was written: a chain left starting mid-way after a prune must have lost only entries from before the cut. */
+  prevAt?: string | null
   extra?: Record<string, unknown>
 }
 
@@ -65,6 +67,7 @@ export function entryHash(e: ChainFields): string {
     reason: e.reason,
     chainKey: e.chainKey,
     seq: e.seq,
+    prevAt: e.prevAt ? new Date(e.prevAt).toISOString() : null,
     extra: e.extra,
   })
   return sha(`${e.prevHash ?? ''}\n${JSON.stringify(body)}`)
@@ -74,7 +77,7 @@ export const valuesHash = (values: unknown) => sha(JSON.stringify(canonical(valu
 
 export const sealDigest = (prevDigest: string | null, hashes: string[], upTo: string, kind = 'seal') => sha(`${prevDigest ?? ''}\n${kind}\n${upTo}\n${hashes.join('\n')}`)
 
-type HeadDoc = { id: string | number; key: string; hash: string; seq: number }
+type HeadDoc = { id: string | number; key: string; hash: string; seq: number; at?: string | null }
 
 export async function readHead(payload: Payload, headsSlug: string, key: string, req?: PayloadRequest): Promise<HeadDoc | null> {
   const { docs } = await payload.find({ collection: headsSlug as never, where: { key: { equals: key } }, limit: 1, depth: 0, overrideAccess: true, pagination: false, ...(req ? { req } : {}) })

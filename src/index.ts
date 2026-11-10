@@ -160,18 +160,28 @@ async function write(payload: Payload, o: Resolved, entry: AuditEntry, values?: 
     if (!o.actions.includes(entry.action)) throw new Error(`audit-trail: "${entry.action}" isn't an action this site records.`)
     if (!o.origins.includes(String(base.origin))) throw new Error(`audit-trail: "${String(base.origin)}" isn't an origin this site records.`)
     const chainKey = `${base.subjectCollection}:${base.subjectId}`
-    // Join the subject's chain: read its head, link to it, and move it only if nobody moved it meanwhile.
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const head = await readHead(payload, o.heads, chainKey, req)
-      const seq = (head?.seq ?? 0) + 1
-      const prevHash = head?.hash ?? null
-      const hash = entryHash({ ...base, chainKey, seq, prevHash, extra })
-      if (!(await moveHead(payload, o.heads, chainKey, head, { hash, seq, at: base.at }, req))) continue
-      const data = { ...base, ...(base.via ? {} : { via: undefined }), ...extra, chainKey, seq, prevHash, hash, ...(hasValues ? { values, valuesHash: valuesHash(values) } : {}) }
-      await payload.create({ collection: o.slug as never, data: data as never, overrideAccess: true, ...(req ? { req } : {}) })
-      return
+    // Without the change's own transaction (an event recorded with only `payload`), open one: the head and the entry go together or not at all.
+    const own = req?.transactionID ? undefined : ((await payload.db.beginTransaction?.()) ?? undefined)
+    const r = own ? ({ ...(req ?? {}), payload, transactionID: own } as unknown as PayloadRequest) : req
+    try {
+      // Join the subject's chain: read its head, link to it, and move it only if nobody moved it meanwhile.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const head = await readHead(payload, o.heads, chainKey, r)
+        const seq = (head?.seq ?? 0) + 1
+        const prevHash = head?.hash ?? null
+        const prevAt = head?.at ? new Date(head.at).toISOString() : null
+        const hash = entryHash({ ...base, chainKey, seq, prevHash, prevAt, extra })
+        if (!(await moveHead(payload, o.heads, chainKey, head, { hash, seq, at: base.at }, r))) continue
+        const data = { ...base, ...(base.via ? {} : { via: undefined }), ...extra, chainKey, seq, prevHash, prevAt, hash, ...(hasValues ? { values, valuesHash: valuesHash(values) } : {}) }
+        await payload.create({ collection: o.slug as never, data: data as never, overrideAccess: true, ...(r ? { req: r } : {}) })
+        if (own) await payload.db.commitTransaction(own)
+        return
+      }
+      throw new Error(`audit-trail: the chain for ${chainKey} kept moving; the entry wasn’t written.`)
+    } catch (error) {
+      if (own) await payload.db.rollbackTransaction(own).catch(() => undefined)
+      throw error
     }
-    throw new Error(`audit-trail: the chain for ${chainKey} kept moving; the entry wasn’t written.`)
   } catch (error) {
     if (o.onWriteError === 'log') {
       payload.logger.error({ err: error, msg: 'audit-trail: an entry was not written (onWriteError: log)' })
@@ -185,6 +195,18 @@ async function who(o: Resolved, req: PayloadRequest) {
   const actor = req.user && (req.user as { collection?: string }).collection === o.users ? (req.user.id as string | number) : null
   const via = o.via ? ((await o.via({ req })) ?? null) : null
   return { actor, via }
+}
+
+/** Per-request sets keyed by `collection:id`: what to skip or annotate applies to that record's own operation only. */
+function skipped(req: PayloadRequest, name: 'auditTrailAutosave'): Set<string>
+function skipped(req: PayloadRequest, name: 'auditTrailRestore'): Map<string, string>
+function skipped(req: PayloadRequest, name: 'auditTrailAutosave' | 'auditTrailRestore'): Set<string> | Map<string, string> {
+  req.context ??= {}
+  const existing = req.context[name]
+  if (existing instanceof Set || existing instanceof Map) return existing as Set<string> | Map<string, string>
+  const made = name === 'auditTrailAutosave' ? new Set<string>() : new Map<string, string>()
+  req.context[name] = made
+  return made
 }
 
 const contextOf = (req: PayloadRequest): AuditContext | false => (req.context?.audit === false ? false : ((req.context?.audit as AuditContext | undefined) ?? {}))
@@ -297,12 +319,17 @@ export async function pruneAuditTrail(payload: Payload, args: { olderThanDays?: 
     valuesCleared = r.docs.length
   }
   if (args.olderThanDays !== undefined) {
-    const cut = before(args.olderThanDays)
-    const checkpoint = await writeSeal(payload, o, async (last) => ({ kind: 'checkpoint', fromAt: null, upTo: cut, count: 0, digest: sealDigest(last?.digest ?? null, [], cut, 'checkpoint') }))
-    if (!checkpoint) throw new Error('audit-trail: a seal ran at the same moment; prune again.')
-    const r = await payload.delete({ collection: o.slug as never, where: { at: { less_than: cut } } as never, overrideAccess: true })
-    deleted = r.docs.length
-    await payload.db.deleteMany({ collection: o.seals, where: { and: [{ seq: { less_than: checkpoint.seq } }] } as never })
+    // Cut only at a seal's end, so every entry kept stays in an intact seal, and seals covering later entries stay.
+    const asked = before(args.olderThanDays)
+    const boundary = (await allSorted(payload, o.seals, { and: [{ kind: { equals: 'seal' } }, { upTo: { less_than_equal: asked } }] }, ['-upTo']))[0] as Seal | undefined
+    if (boundary) {
+      const cut = new Date(boundary.upTo).toISOString()
+      const checkpoint = await writeSeal(payload, o, async (last) => ({ kind: 'checkpoint', fromAt: null, upTo: cut, count: 0, digest: sealDigest(last?.digest ?? null, [], cut, 'checkpoint') }))
+      if (!checkpoint) throw new Error('audit-trail: a seal ran at the same moment; prune again.')
+      const r = await payload.delete({ collection: o.slug as never, where: { at: { less_than_equal: cut } } as never, overrideAccess: true })
+      deleted = r.docs.length
+      await payload.db.deleteMany({ collection: o.seals, where: { and: [{ kind: { equals: 'seal' } }, { upTo: { less_than_equal: cut } }] } as never })
+    }
   }
   return { valuesCleared, deleted }
 }
@@ -337,8 +364,8 @@ export async function verifyAuditTrail(payload: Payload, args: { since?: Date; n
     if (prev) {
       if (e.seq !== prev.seq + 1) return fail(e.id, `an entry before it in ${e.chainKey} is missing`, checked)
       if (e.prevHash !== prev.hash) return fail(e.id, `it doesn't link to the entry before it in ${e.chainKey}`, checked)
-    } else if (e.seq !== 1 && !(checkpoint && e.at >= checkpoint.upTo)) {
-      // A chain may start later only where a checkpoint recorded the cut.
+    } else if (e.seq !== 1 && !(checkpoint && e.prevAt && new Date(e.prevAt).toISOString() <= checkpoint.upTo)) {
+      // A chain may start mid-way only where a checkpoint recorded the cut, and only if what's gone was from before it.
       return fail(e.id, `the start of ${e.chainKey} is missing`, checked)
     } else if (e.seq === 1 && e.prevHash) return fail(e.id, 'a first entry links to something', checked)
     lastByChain.set(e.chainKey, e)
@@ -444,6 +471,7 @@ function trailCollection(o: Resolved, opts: AuditTrailOptions): CollectionConfig
       { name: 'chainKey', type: 'text', index: true, admin: { readOnly: true, position: 'sidebar' } },
       { name: 'seq', type: 'number', index: true, admin: { readOnly: true, position: 'sidebar' } },
       { name: 'prevHash', type: 'text', admin: { readOnly: true, position: 'sidebar' } },
+      { name: 'prevAt', type: 'date', admin: { hidden: true } },
       { name: 'hash', type: 'text', index: true, admin: { readOnly: true, position: 'sidebar' } },
       { name: 'valuesHash', type: 'text', admin: { hidden: true } },
       ...(opts.extraFields ?? []),
@@ -512,10 +540,11 @@ export const auditTrail =
     const record = async (action: 'create' | 'update' | 'delete', slug: string, doc: Record<string, unknown>, previous: Record<string, unknown> | undefined, req: PayloadRequest, skip: Set<string>) => {
       const audit = contextOf(req)
       if (audit === false) return
-      if (req.context?.auditTrailAutosave) return // drafts saved by autosave aren't recorded; publishing and saving are
+      // A draft's autosave of this very record isn't recorded (publishing and saving are); keyed to the record, never the whole request.
+      if (action === 'update' && skipped(req, 'auditTrailAutosave').has(`${slug}:${String(doc.id)}`)) return
       const fields = action === 'delete' ? [] : changed(doc, action === 'create' ? undefined : previous, skip)
       if (action === 'update' && fields.length === 0) return
-      const restored = req.context?.auditTrailRestore as string | undefined
+      const restored = action === 'update' ? (skipped(req, 'auditTrailRestore') as Map<string, string>).get?.(`${slug}:${String(doc.id)}`) : undefined
       const { actor, via } = await who(o, req)
       const names = action === 'update' ? (o.values[slug] ?? []).filter((n) => fields.includes(n)) : []
       const values = names.length ? Object.fromEntries(names.map((n) => [n, { before: stored(previous?.[n], o.valueMaxBytes), after: stored(doc[n], o.valueMaxBytes) }])) : undefined
@@ -546,9 +575,20 @@ export const auditTrail =
           if (!o.collections.includes(collection.slug)) return collection
           // Join fields list other documents; they aren't this record's data.
           const skip = new Set([...o.ignore, ...(collection.fields as AnyField[]).filter((f) => f.type === 'join').map((f) => String(f.name))])
-          const beforeOperation: CollectionBeforeOperationHook = ({ args, operation, req }) => {
-            if ((args as { autosave?: boolean }).autosave) req.context = { ...(req.context ?? {}), auditTrailAutosave: true }
-            if (operation === 'restoreVersion') req.context = { ...(req.context ?? {}), auditTrailRestore: String((args as { id?: unknown }).id ?? '') }
+          const autosaves = Boolean(collection.versions && typeof collection.versions === 'object' && collection.versions.drafts && typeof collection.versions.drafts === 'object' && collection.versions.drafts.autosave)
+          const beforeOperation: CollectionBeforeOperationHook = async ({ args, operation, req }) => {
+            const a = args as { autosave?: boolean; draft?: boolean; id?: string | number }
+            if (operation === 'update' && a.id !== undefined) {
+              const key = `${collection.slug}:${String(a.id)}`
+              // Only a real draft autosave: the collection autosaves drafts, it's a draft, and it's this record.
+              if (autosaves && a.draft === true && a.autosave === true) skipped(req, 'auditTrailAutosave').add(key)
+              else skipped(req, 'auditTrailAutosave').delete(key)
+            }
+            if (operation === 'restoreVersion' && a.id !== undefined) {
+              const version = (await req.payload.findVersionByID({ collection: collection.slug as never, id: String(a.id), depth: 0, overrideAccess: true, req }).catch(() => null)) as { parent?: unknown } | null
+              const parent = version?.parent && typeof version.parent === 'object' ? (version.parent as { id: unknown }).id : version?.parent
+              if (parent !== undefined && parent !== null) (skipped(req, 'auditTrailRestore') as Map<string, string>).set(`${collection.slug}:${String(parent)}`, String(a.id))
+            }
             return args
           }
           const afterChange: CollectionAfterChangeHook = async ({ doc, operation, previousDoc, req }) => {
@@ -559,8 +599,13 @@ export const auditTrail =
             await record('delete', collection.slug, doc, undefined, req, skip)
             return doc
           }
-          const afterOperation: CollectionAfterOperationHook = ({ operation, req, result }) => {
-            if (operation === 'restoreVersion' || (req.context?.auditTrailAutosave && operation === 'update')) req.context = { ...(req.context ?? {}), auditTrailRestore: undefined, auditTrailAutosave: undefined }
+          const afterOperation: CollectionAfterOperationHook = ({ args, operation, req, result }) => {
+            const id = (args as { id?: string | number }).id
+            if (operation === 'update' && id !== undefined) skipped(req, 'auditTrailAutosave').delete(`${collection.slug}:${String(id)}`)
+            if (operation === 'restoreVersion') {
+              const parent = (result as { id?: unknown } | undefined)?.id
+              if (parent !== undefined) (skipped(req, 'auditTrailRestore') as Map<string, string>).delete(`${collection.slug}:${String(parent)}`)
+            }
             return result
           }
           return {

@@ -2,7 +2,7 @@
 
 A tamper-evident audit trail for Payload: who changed which fields of which record, from where and through whom, never the values. Each record's entries are hash-chained, a seal chains them across the site, and a verify reports the first break.
 
-**Status:** early, 0.1.0, not on npm yet. 23 tests pass against a real Payload 3.92 with an in-memory MongoDB (a replica set). They cover what's recorded, failing closed with and without transactions, the value log and its startup refusals, read access, drafts and restores, the sink for other plugins, retention, and the chain: 40 changes at once without a fork, two seals at once, and tampering caught each way (an entry edited, the newest deleted, one removed or forged, a whole record's chain deleted after a seal, values edited). It isn't in use on any site yet.
+**Status:** early, 0.1.0, not on npm yet. 25 tests pass against a real Payload 3.92 with an in-memory MongoDB (a replica set). They cover what's recorded, failing closed with and without transactions, the value log and its startup refusals, read access, drafts, autosave and restores, the sink for other plugins, retention, and the chain: 40 changes at once without a fork, two seals at once, and tampering caught each way (an entry edited, the newest deleted, one removed or forged, a whole record's chain deleted after a seal, values edited, the first entry after a prune deleted). It isn't in use on any site yet.
 
 ## What it does
 
@@ -17,7 +17,7 @@ A tamper-evident audit trail for Payload: who changed which fields of which reco
   - **A change is fully protected once it's sealed.** Before that, the record's head still shows a deleted or changed newest entry, but not a whole record removed along with its head.
 - **An opt-in value log** for fields you name (`values`), such as a studbook number. It keeps their old and new values. The plugin refuses at startup to log anything hidden, read-restricted, marked secret or encrypted, inside an array, a sign-in field, on your `personal` list, or a link to people not in `allowPeople`. Values are capped at 2 KB a field, readable only by `access.values` (nobody by default), and hashed separately, so clearing them keeps the chain whole.
 - **A sink for other plugins.** `recordEvent(payload, { action, subject, req, … })` writes one entry with the same rules. `fromPluginEvent(mapper)` adapts another plugin's `onEvent` in one line. It throws if the event can't be recorded, unless you choose `{ onError: 'log' }`.
-- **Retention you run.** `pruneAuditTrail(payload, { valuesOlderThanDays, olderThanDays })` from your job; nothing is deleted without arguments. Deleting entries first writes a checkpoint seal recording the cut.
+- **Retention you run.** `pruneAuditTrail(payload, { valuesOlderThanDays, olderThanDays })` from your job; nothing is deleted without arguments. Entries are cut only at the end of a seal no later than the age you ask for, and a checkpoint seal records the cut first. With no such seal yet, nothing is deleted.
 
 ## Install
 
@@ -48,13 +48,13 @@ export default buildConfig({
 - **Copy each seal out.** A hash chain only shows tampering if its newest digest is also kept somewhere the database's writers can't reach. Without `onSeal`, anyone with write access to the database can rewrite every entry, head and seal consistently, and verify would pass.
 - **`access.values` must be at least as strict as reading the records themselves.** On a multi-site install, `access.read` must filter by site.
 - **Writes that skip Payload** (`payload.db.*`, or a database client) aren't recorded, and neither is the plugin's own bookkeeping.
-- **Drafts:** autosave isn't recorded; publishing and saving are. Restoring a version is recorded as an update with `restored version <id>` as its reason.
+- **Drafts:** a draft autosave of a record isn't recorded; publishing and saving are, and so is any other record a hook changes during an autosave. An autosave flag on a collection without drafts, or on a non-draft save, doesn't skip anything. Restoring a version is recorded as an update with `restored version <id>` as its reason.
 
 ## Limits
 
 - MongoDB only for now (it relies on transactions and the adapter's conditional updates).
 - Verify reads the whole trail into memory; for very large trails, run it with `since`.
-- Two changes to the same record at the same moment already conflict in Payload, so one of them fails, as without this plugin. Changes to different records never wait on each other.
+- Two changes to the same record at the same moment already conflict in Payload, so one of them fails, as without this plugin. The same goes for two entries for one record written from different transactions at once (say, a change and a `recordEvent`): the loser fails closed and its change is rolled back. Changes to different records never wait on each other.
 
 ## Commands
 

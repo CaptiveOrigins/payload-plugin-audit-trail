@@ -3,7 +3,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { BasePayload, buildConfig, createLocalReq, getPayload, type CollectionConfig, type Payload, type PayloadRequest } from 'payload'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { auditTrail, fromPluginEvent, pruneAuditTrail, recordEvent, type AuditTrailOptions } from '../src/index.js'
+import { auditTrail, fromPluginEvent, pruneAuditTrail, recordEvent, sealAuditTrail, verifyAuditTrail, type AuditTrailOptions } from '../src/index.js'
 
 /**
  * A made-up site: accounts, and studbook entries with drafts (autosave on) whose number and holder are logged with
@@ -35,9 +35,12 @@ const entries: CollectionConfig = {
     { name: 'mates', type: 'join', collection: 'studbook-entries', on: 'holder' } as never,
   ],
 }
+const plain: CollectionConfig = { slug: 'plain-notes', access: { read: () => true, create: () => true, update: () => true }, fields: [{ name: 'text', type: 'text' }] }
+// During an autosave of an entry, a hook changes another audited record: that change must still be recorded.
+entries.hooks = { afterChange: [async ({ req, context }) => { if (context?.touchUser) await req.payload.update({ collection: 'users', id: String(context.touchUser), data: { name: `touched ${Date.now()}` } as never, overrideAccess: true, req }) }] }
 const isAdmin = ({ req }: { req: PayloadRequest }) => (req.user as unknown as U | null)?.role === 'admin'
 const base: AuditTrailOptions = {
-  collections: ['users', 'studbook-entries'],
+  collections: ['users', 'studbook-entries', 'plain-notes'],
   actions: ['masquerade', 'hats'],
   access: { read: isAdmin, values: isAdmin },
   via: () => (via === 'hats' ? { kind: 'hats', id: 'from-account-1' } : null),
@@ -48,7 +51,7 @@ const base: AuditTrailOptions = {
   extra: () => ({ tenant: 't1' }),
 }
 const cfg = (opts: AuditTrailOptions = base, dbExtra: Record<string, unknown> = {}) =>
-  buildConfig({ secret: SECRET, telemetry: false, typescript: { autoGenerate: false }, db: mongooseAdapter({ url: mongo.getUri('audit'), ensureIndexes: true, ...dbExtra }), collections: [users, entries], plugins: [auditTrail(opts)] })
+  buildConfig({ secret: SECRET, telemetry: false, typescript: { autoGenerate: false }, db: mongooseAdapter({ url: mongo.getUri('audit'), ensureIndexes: true, ...dbExtra }), collections: [users, entries, plain], plugins: [auditTrail(opts)] })
 
 const events = async (where: Record<string, unknown> = {}) =>
   (await payload.find({ collection: 'audit-events' as never, where: where as never, sort: '-at', limit: 50, depth: 0, overrideAccess: true, showHiddenFields: true })).docs as unknown as Record<string, any>[]
@@ -179,6 +182,31 @@ describe('drafts and versions', () => {
   })
 })
 
+describe('autosave can’t hide a change', () => {
+  it('is recorded on a collection without drafts, for a non-draft save sent with autosave, and for a draft save', async () => {
+    const count = async (id: string) => (await events({ subjectId: { equals: id } })).length
+    const note = (await payload.create({ collection: 'plain-notes', data: { text: 'one' } as never, overrideAccess: true })) as unknown as { id: string }
+    await payload.update({ collection: 'plain-notes', id: note.id, data: { text: 'two' } as never, draft: true, autosave: true, overrideAccess: true } as never)
+    expect(await count(note.id)).toBe(2)
+    const e = await newEntry({ notes: 'a' })
+    const start = await count(e.id)
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { notes: 'b' } as never, draft: false, autosave: true, overrideAccess: true } as never)
+    expect(await count(e.id)).toBe(start + 1)
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { notes: 'c' } as never, draft: true, overrideAccess: true } as never)
+    expect(await count(e.id)).toBe(start + 2)
+    // And the real thing is still skipped.
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { notes: 'typing' } as never, draft: true, autosave: true, overrideAccess: true } as never)
+    expect(await count(e.id)).toBe(start + 2)
+  })
+
+  it('records another record changed by a hook during a real autosave', async () => {
+    const e = await newEntry({ notes: 'a' })
+    const before = (await events({ subjectId: { equals: member.id } })).length
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { notes: 'typing' } as never, draft: true, autosave: true, overrideAccess: true, context: { touchUser: member.id } } as never)
+    expect((await events({ subjectId: { equals: member.id } })).length).toBe(before + 1)
+  })
+})
+
 describe('a sink for other plugins', () => {
   it('records named events, refuses unknown actions, and fails the caller when an event can’t be recorded', async () => {
     const req = (await as(admin)).req
@@ -208,6 +236,8 @@ describe('retention', () => {
     const total = (await events()).length
     expect(await pruneAuditTrail(payload)).toEqual({ valuesCleared: 0, deleted: 0 })
     const future = new Date(Date.now() + 400 * 86_400_000)
+    // Entries are deleted only up to a seal's end, so seal everything first (in simulated time).
+    await sealAuditTrail(payload, { now: future, upTo: new Date(future.getTime() - 365 * 86_400_000) })
     const v = await pruneAuditTrail(payload, { valuesOlderThanDays: 365, now: future })
     expect(v.valuesCleared).toBeGreaterThan(0)
     expect((await latestFor(e.id)).values ?? null).toBeNull()

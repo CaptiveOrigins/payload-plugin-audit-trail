@@ -126,3 +126,11 @@ Choices left as stated: SHA-256, hex. `audit-heads` and seals are append-only (a
     - **Seals can't fork:** two seals run at once update a seal head conditionally, as entries do. The loser does nothing. Tested.
     - **Seals refuse the future:** `upTo` must be at least the grace before now. Verify reports entries unsealed for longer than an interval as a **warning**, not a break.
     - **extraFields hash by name,** and a missing or null value hashes as missing, so adding an extra field later doesn't change old hashes.
+
+## Changes after Platform's read of `21b195e` (2026-11-10)
+
+- **Blocker: autosave could hide a real change.** The skip now applies only when the collection autosaves drafts, the call is `draft: true` and `autosave: true`, and it names a record; it's keyed to that record, so hooks changing other records during it are recorded. Restores are keyed the same way.
+- **Entries outside a request transaction** open their own, so the entry and the head move together.
+- **Pruning cuts only at a seal's end** no later than the age asked, and deletes only seals ending at or before the cut, so every entry kept stays inside an intact seal.
+- **Each entry hashes `prevAt`**, when the entry before it was written. A chain that starts mid-way after a prune verifies only with a checkpoint and `prevAt` at or before the cut, so deleting the first entry after the cut is caught.
+

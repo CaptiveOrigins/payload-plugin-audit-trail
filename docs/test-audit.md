@@ -16,14 +16,15 @@ Each promise in the README and ADR 0001, and the test that proves it:
 | Startup refusals (hidden, read access, secret, personal, people, missing, sign-in) | "refuses at startup to log…" |
 | Values and the trail read only with their access | "shows values only to access.values…" |
 | Autosave not recorded; restore recorded with its reason | "records publishing and saving…" |
+| Autosave skips only a real draft autosave of that record: no-drafts collections, `draft: false`, and other records changed by hooks are recorded | "autosave can’t hide a change" |
 | Sink, unknown actions refused, mapper errors fail unless `log` | "records named events…" |
-| Retention: values cleared, entries deleted, nothing without arguments | "clears old values and deletes…" |
+| Retention: values cleared, entries deleted only up to a seal, nothing without arguments | "clears old values and deletes…" |
 | Chain links in order; untouched history verifies | chain: "links each record's entries…" |
 | No fork under 40 changes at once and 10 on one record | "doesn't fork…" |
 | Tampering caught: edited, newest deleted, middle deleted or forged, whole chain deleted after a seal, values edited | "catching tampering" (the head check fails its test when removed) |
 | Two seals at once don't fork | "two seals at once…" (fails when the seal head is unconditional) |
 | Seals refuse the grace; overdue entries warn | "refuses to reach closer than the grace…" |
-| Pruning writes a checkpoint, and what remains verifies | "pruning old entries…" |
+| Pruning cuts at a seal’s end with a checkpoint; what remains verifies; deleting the first entry after the cut is caught | "pruning cuts at a seal’s end…" |
 | Hash stable on read back; missing equals null; extra fields added later | "the hash itself" |
 
 Gaps, skipped with reason: Postgres (not supported in 0.1, said in Limits); a verify over a very large trail (`since` exists, a scale test belongs to the site).
