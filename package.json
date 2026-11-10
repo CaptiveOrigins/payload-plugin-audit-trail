@@ -1,0 +1,62 @@
+{
+  "name": "@captiveorigins/payload-plugin-audit-trail",
+  "version": "0.1.0",
+  "description": "Tamper-evident audit trail for Payload: who changed which fields, from where and through whom, never the values, hash-chained per record and sealed across the site, with a verify that reports any break; an opt-in old-value log and a sink for other plugins.",
+  "keywords": [
+    "payload",
+    "payload-plugin",
+    "payloadcms",
+    "audit",
+    "audit-trail",
+    "audit-log",
+    "tamper-evident",
+    "hash-chain",
+    "compliance",
+    "provenance"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/CaptiveOrigins/payload-plugin-audit-trail#readme",
+  "bugs": {
+    "url": "https://github.com/CaptiveOrigins/payload-plugin-audit-trail/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CaptiveOrigins/payload-plugin-audit-trail.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "payload": "^3.80.0"
+  },
+  "devDependencies": {
+    "@payloadcms/db-mongodb": "3.92.1",
+    "@types/node": "^24.0.0",
+    "graphql": "^16.14.2",
+    "mongodb-memory-server": "^11.3.0",
+    "payload": "3.92.1",
+    "typescript": "^5.9.0",
+    "vitest": "^5.1.0"
+  }
+}

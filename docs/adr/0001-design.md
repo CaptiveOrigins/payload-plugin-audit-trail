@@ -119,3 +119,10 @@ The owner chose a hash-chained, tamper-evident trail (relayed by Platform, 2026-
     - Tests: an entry edited directly in the database (a field changed, a link changed, an entry deleted within a sealed range) is caught; untouched history passes.
 
 Choices left as stated: SHA-256, hex. `audit-heads` and seals are append-only (access false; only the plugin writes). With `onWriteError: 'log'`, a failed entry also leaves its chain untouched.
+
+15. **Platform's additions to the chain (2026-11-10).**
+    - **Heads are checked:** verify compares each `audit-heads` document with the last entry of its chain (hash and sequence). Deleting the newest entry, or a subject's whole chain, shows even before it's sealed.
+    - **A change is fully protected once sealed.** The README says so. The seal interval is an option (`sealEveryHours`, default 24; hourly suits a busy site).
+    - **Seals can't fork:** two seals run at once update a seal head conditionally, as entries do. The loser does nothing. Tested.
+    - **Seals refuse the future:** `upTo` must be at least the grace before now. Verify reports entries unsealed for longer than an interval as a **warning**, not a break.
+    - **extraFields hash by name,** and a missing or null value hashes as missing, so adding an extra field later doesn't change old hashes.
