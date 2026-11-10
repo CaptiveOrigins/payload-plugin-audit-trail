@@ -6,6 +6,8 @@
     "payload",
     "payload-plugin",
     "payloadcms",
+    "security",
+    "privacy",
     "audit",
     "audit-trail",
     "audit-log",
