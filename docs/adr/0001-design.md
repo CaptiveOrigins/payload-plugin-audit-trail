@@ -1,6 +1,6 @@
 # ADR 0001: Audit trail for Payload, the design
 
-Status: proposed, 2026-11-10. Lead: Plugin Security. Independent pre-publish security read: Platform. Approved as an agnostic plugin by the owner, 2026-11-10 (relayed by Helm).
+Status: proposed, 2026-11-10. Lead: Plugin Security. Independent pre-publish security read: Platform, cleared for the first public push at `2670bb8` (2026-11-10). Approved as an agnostic plugin by the owner, 2026-11-10 (relayed by Helm).
 
 ## Context
 
