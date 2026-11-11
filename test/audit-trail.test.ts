@@ -45,6 +45,15 @@ const users: CollectionConfig = {
   hooks: {
     // A site's own hook raising a hidden field.
     beforeChange: [({ data, context }) => (context?.promote ? { ...data, tier: 'admin' } : data)],
+    // And one that writes the same record again, nested, on the same request.
+    afterChange: [
+      async ({ doc, req, context }) => {
+        const name = context?.innerName
+        if (!name) return
+        delete context.innerName
+        await req.payload.update({ collection: 'users', id: doc.id, data: { name } as never, overrideAccess: true, req })
+      },
+    ],
   },
 }
 const entries: CollectionConfig = {
@@ -610,6 +619,28 @@ describe('concurrent writes on one request (re-read of 4fbe939)', () => {
     spy.mockRestore()
     await payload.login({ collection: 'users', data: { email: 'reset-b@example.invalid', password: 'Made-up-fan-out-pass-0' }, req })
     expect((await accountUpdates(a.id)).length + (await accountUpdates(b.id)).length).toBe(0)
+  })
+
+  it('two nested writes to one record each use their own reading: the inner entry is exact', async () => {
+    const u = await account('nested-same@example.invalid')
+    await payload.update({ collection: 'users', id: u.id, data: { password: 'Made-up-fan-out-pass-7' } as never, overrideAccess: true, context: { innerName: 'Inner' } })
+    const got = (await accountUpdates(u.id)).map((e) => e.changedFields as string[])
+    expect(got.length).toBe(2)
+    expect(got).toContainEqual(['name'])
+    expect(got.find((f) => f.includes('password'))).toBeTruthy()
+  })
+
+  it('forgets a failed reset’s reading: a later password change and sign-in on the same request record the change once', async () => {
+    const a = await account('reset-forgot@example.invalid')
+    const token = await payload.forgotPassword({ collection: 'users', data: { email: 'reset-forgot@example.invalid' }, disableEmail: true })
+    const { req } = await as(null)
+    const real = payload.db.updateOne.bind(payload.db)
+    const spy = vi.spyOn(payload.db, 'updateOne').mockImplementation(((args: { collection: string }) => (args.collection === 'users' ? Promise.reject(new Error('made-up outage')) : real(args as never))) as never)
+    await expect(payload.resetPassword({ collection: 'users', data: { token: String(token), password: 'Made-up-fan-out-pass-6' }, overrideAccess: true, req })).rejects.toThrow()
+    spy.mockRestore()
+    await payload.update({ collection: 'users', id: a.id, data: { password: 'Made-up-fan-out-pass-5' } as never, overrideAccess: true, req })
+    await payload.login({ collection: 'users', data: { email: 'reset-forgot@example.invalid', password: 'Made-up-fan-out-pass-5' }, req })
+    expect((await accountUpdates(a.id)).map((e) => e.changedFields)).toEqual([['password']])
   })
 
   it('records a reset once even when the same request signs in again afterwards', async () => {

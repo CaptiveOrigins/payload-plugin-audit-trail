@@ -202,3 +202,5 @@ Now 77 tests on main.
 | Bulk and nested writes still pass | the tests above, unchanged |
 
 The two reset guards that survived the last mutation check were redundant with a third; one was removed (the sign-in clear), and the other two now each have a test that fails without them.
+
+After the third read (approved f8cdfb4), 79 tests: "two nested writes to one record each use their own reading…" (fails if the oldest reading is taken instead of the newest, the mutation that survived before) and "forgets a failed reset's reading…" (failed first). The sign-in clear removed in f8cdfb4 is back, now with a test that isolates it. Known and stated in the README: an outer entry may also list a hidden field or password a nested inner write changed.

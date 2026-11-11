@@ -778,6 +778,8 @@ export const auditTrail =
               if (found) resets.set(req, { id: String(found.id), before: found.digests })
               else resets.delete(req)
             }
+            // A reset that failed never reached afterLogin: a sign-in of its own forgets that reset's reading.
+            if (operation === 'login') resets.delete(req)
             if (operation === 'update' && a.id !== undefined) {
               const key = `${collection.slug}:${String(a.id)}`
               // Only a real draft autosave: the collection autosaves drafts, it's a draft, and it's this record.
