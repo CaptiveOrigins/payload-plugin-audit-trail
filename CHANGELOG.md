@@ -2,10 +2,12 @@
 
 ## Unreleased
 
-- Setting a password (create, update, or a reset by emailed link) records `password` by name. Only the hash and salt change, and those are never listed, so it used to leave no entry. The plugin keeps the names of the fields a write sent, and whether it set a password, in `req.context`: never a value. Found by the Captive Origins site (K428); its tests are ported.
-- A hidden or read-restricted field no longer shows as changed on every update. The saved copy leaves it out when it isn't read back; it now counts only if the write set it, or both copies hold it and differ.
+- Setting a password (create, update, or a reset by emailed link) records `password` by name, when the stored hash or salt changed. They're never listed, so it used to leave no entry. Found by the Captive Origins site (K428); its tests are ported.
+- A hidden or read-restricted field no longer shows as changed on every update. It's compared as stored, read inside the write's transaction before and after, so a change made by a site hook or a restore is still recorded and an unchanged one isn't. Only digests are kept, in memory, per request and per write (a stack, so nested and concurrent writes don't mix), never in `req.context`.
+- An auth collection's create no longer lists `collection`.
+- `onWriteError: 'log'` logs the error's name, not its message.
 - `fromPluginEvent` finds Payload when an event has no `req`: from the event's `payload`, a `{ payload }` binding, or the one Payload the plugin started on (it refuses to guess between several). MFA's `start(payload, { userId })` raises such an event.
-- `fromPluginEvent` no longer rejects a plugin's action when an event without a `req` can't be recorded: there's no transaction to undo, so it logs the error's name and returns. With a `req` it still fails closed. `onError: 'fail'` is the new strict mode; `onError: 'log'` is as before, now logging the name only.
+- `fromPluginEvent` no longer rejects a plugin's action when the write fails for an event without a `req`: there's no transaction to undo, so it logs the error's name and returns. A mapper error, an unknown action or origin, or no Payload found still throw, with or without a `req`, as do failed writes with a `req`. `onError: 'fail'` throws always; `onError: 'log'` is as before, now logging the name only.
 - The README's `via` example records the Hats hat worn as well as the account, as Hats' README promises.
 
 ## 0.1.0 (not yet published)

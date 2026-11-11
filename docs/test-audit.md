@@ -166,3 +166,19 @@ From the Captive Origins site's own trail (K428, its tests ported) and the combo
 | The README's `via` records the hat worn | combo: "records which hat was worn…" |
 
 Mutation-checked: each guard removed fails at least one of these tests (see the commit message). Gaps skipped: a password set by a bulk `update` with `where` is covered by the same code path as an update by id (keyed `collection:*`) and isn't tested separately.
+
+## 2026-11-11: after the security read of ef35392 and the site lead's audit (PR #117)
+
+Now 72 tests on main. Each new test below failed on ef35392 first, except two kept as guards (marked).
+
+| Promise | Test |
+| --- | --- |
+| A hidden field a site hook changed is recorded; one set to what it was isn't; a user create doesn't list `collection` | "records a hidden field a site hook changed…" |
+| A restore that puts a hidden field back is recorded | "records a restore that puts a hidden field back" |
+| A bulk update records a read-restricted field per record, and leaves it out where only a readable field changed (guard: passed on ef35392) | "records a bulk update of a read-restricted field…" |
+| `password` comes from the stored hash: a field hook that strips it records nothing for it, one that sets it records it | "decides a password changed from the stored hash…" |
+| A sign-in after a failed reset on the same request records nothing | "records no password change for a sign-in after a failed reset…" |
+| A reset is recorded once; a plain sign-in records nothing (guard) | "records a successful reset once…" |
+| Concurrent creates and updates sharing one context object each record their own fields | "two concurrent writes sharing one context object…" |
+| A nested write in a hook doesn't clobber the outer one (guard: passed on ef35392, whose keys were per record) | "a nested write inside a hook…" |
+| Without a `req`, mapper errors and unknown actions still throw; only a failed write logs its name and returns | "without a request, a failed write logs…" |

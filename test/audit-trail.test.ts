@@ -23,11 +23,29 @@ const users: CollectionConfig = {
   auth: true,
   access: { read: () => true, update: () => true },
   fields: [
-    { name: 'name', type: 'text' },
+    {
+      name: 'name',
+      type: 'text',
+      // A site's field hook that sets or strips the password before Payload reads it.
+      hooks: {
+        beforeValidate: [
+          ({ value, siblingData, context }) => {
+            if (context?.stripPassword) delete (siblingData as { password?: string }).password
+            if (context?.setPassword) (siblingData as { password?: string }).password = String(context.setPassword)
+            return value
+          },
+        ],
+      },
+    },
     { name: 'role', type: 'text' },
     { name: 'emailChange', type: 'text', hidden: true },
+    { name: 'tier', type: 'text', hidden: true },
     { name: 'twoStep', type: 'group', access: { read: () => false }, fields: [{ name: 'secret', type: 'text' }, { name: 'enabledAt', type: 'date' }] },
   ],
+  hooks: {
+    // A site's own hook raising a hidden field.
+    beforeChange: [({ data, context }) => (context?.promote ? { ...data, tier: 'admin' } : data)],
+  },
 }
 const entries: CollectionConfig = {
   slug: 'studbook-entries',
@@ -48,7 +66,15 @@ const entries: CollectionConfig = {
 }
 const plain: CollectionConfig = { slug: 'plain-notes', access: { read: () => true, create: () => true, update: () => true }, fields: [{ name: 'text', type: 'text' }] }
 // During an autosave of an entry, a hook changes another audited record: that change must still be recorded.
-entries.hooks = { afterChange: [async ({ req, context }) => { if (context?.touchUser) await req.payload.update({ collection: 'users', id: String(context.touchUser), data: { name: `touched ${Date.now()}` } as never, overrideAccess: true, req }) }] }
+// A nested write inside a hook: saving one entry also sets another entry's hidden note, on the same request.
+entries.hooks = {
+  beforeChange: [
+    async ({ data, req, context, originalDoc }) => {
+      if (context?.nestedFrom && String(context.nestedFrom) === String(originalDoc?.id)) await req.payload.update({ collection: 'studbook-entries', id: String(context.nestedTo), data: { hiddenNote: `nested ${Date.now()}` } as never, overrideAccess: true, req })
+      return data
+    },
+  ],
+  afterChange: [async ({ req, context }) => { if (context?.touchUser) await req.payload.update({ collection: 'users', id: String(context.touchUser), data: { name: `touched ${Date.now()}` } as never, overrideAccess: true, req }) }] }
 const isAdmin = ({ req }: { req: PayloadRequest }) => (req.user as unknown as U | null)?.role === 'admin'
 const base: AuditTrailOptions = {
   collections: ['users', 'studbook-entries', 'plain-notes'],
@@ -411,23 +437,120 @@ describe('fromPluginEvent without a request', () => {
     for (const e of await events({ reason: { in: ['from-event', 'bound'] } })) expect(e).toMatchObject({ actor: null, origin: 'script' })
   })
 
-  it('never rejects the plugin’s own action without a request: it logs the error’s name, unless the site chose strict', async () => {
-    const unknown = (e: { user: string }) => ({ action: 'teleport', subject: { collection: 'users', id: e.user }, reason: 'secret-detail-in-message' })
-    let result: unknown = 'not run'
-    const logs = await logsDuring(async () => {
-      result = await fromPluginEvent(unknown, { payload })({ user: member.id })
-    })
-    expect(result).toBeUndefined()
-    expect(logs).toContain('Error')
-    expect(logs).not.toContain("isn't an action")
+  it('without a request, a failed write logs the error’s name and returns; a mapper error or unknown action still throws', async () => {
+    const unknown = (e: { user: string; payload?: Payload }) => ({ action: 'teleport', subject: { collection: 'users', id: e.user } })
+    await expect(fromPluginEvent(unknown, { payload })({ user: member.id })).rejects.toThrow(/isn't an action/)
+    await expect(fromPluginEvent(unknown, { payload })({ user: member.id, payload })).rejects.toThrow(/isn't an action/)
     const broken = () => {
       throw new TypeError('the mapper read something it should not have')
     }
-    const brokenLogs = await logsDuring(() => fromPluginEvent(broken)({}))
-    expect(brokenLogs).toContain('TypeError')
-    expect(brokenLogs).not.toContain('should not have')
-    await expect(fromPluginEvent(unknown, { onError: 'fail', payload })({ user: member.id })).rejects.toThrow(/isn't an action/)
+    await expect(fromPluginEvent(broken, { payload })({})).rejects.toThrow(TypeError)
+    // The write itself fails (a made-up outage): logged by name, the plugin's action goes on.
+    const known = (e: { user: string }) => ({ action: 'hats', subject: { collection: 'users', id: e.user }, reason: 'outage' })
+    const orig = payload.db.create.bind(payload.db)
+    const spy = vi.spyOn(payload.db, 'create').mockImplementation(((args: { collection: string }) => (args.collection === 'audit-events-heads' ? Promise.reject(new RangeError('made-up outage with details')) : orig(args as never))) as never)
+    let result: unknown = 'not run'
+    const logs = await logsDuring(async () => {
+      result = await fromPluginEvent(known, { payload })({ user: 'no-chain-yet-1' })
+    })
+    expect(result).toBeUndefined()
+    expect(logs).toContain('RangeError')
+    expect(logs).not.toContain('with details')
+    await expect(fromPluginEvent(known, { payload, onError: 'fail' })({ user: 'no-chain-yet-2' })).rejects.toThrow(/made-up outage/)
+    spy.mockRestore()
     // With a request, the default still fails closed.
     await expect(fromPluginEvent((e: { req: PayloadRequest }) => ({ ...unknown({ user: member.id }), req: e.req }))({ req: (await as(admin)).req })).rejects.toThrow(/isn't an action/)
+  })
+})
+
+describe('stored changes the saved copy can’t show (security read of ef35392)', () => {
+  it('records a hidden field a site hook changed, and nothing when a hidden field is set to what it was', async () => {
+    const u = (await payload.create({ collection: 'users', data: { email: 'hooked@example.invalid', password: 'Made-up-hooked-pass-1', role: 'member', tier: 'member' } as never })) as unknown as U
+    expect((await latestFor(u.id)).changedFields).not.toContain('collection')
+    await payload.update({ collection: 'users', id: u.id, data: { name: 'Hooked' } as never, ...(await as(admin, { promote: true })) })
+    expect((await accountUpdates(u.id))[0]!.changedFields).toEqual(['name', 'tier'])
+    const n = (await accountUpdates(u.id)).length
+    await payload.update({ collection: 'users', id: u.id, data: { tier: 'admin' } as never, ...(await as(admin)) })
+    expect((await accountUpdates(u.id)).length).toBe(n)
+  })
+
+  it('records a restore that puts a hidden field back', async () => {
+    const e = await newEntry({ hiddenNote: 'first' })
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { hiddenNote: 'second', _status: 'published' } as never, overrideAccess: true })
+    const { docs } = await payload.findVersions({ collection: 'studbook-entries', where: { parent: { equals: e.id } }, sort: 'createdAt', depth: 0, overrideAccess: true, showHiddenFields: true })
+    const first = docs.find((v) => (v.version as { hiddenNote?: string }).hiddenNote === 'first')!
+    await payload.restoreVersion({ collection: 'studbook-entries', id: String(first.id), overrideAccess: true })
+    const latest = await latestFor(e.id)
+    expect(latest.reason).toMatch(/^restored version/)
+    expect(latest.changedFields).toContain('hiddenNote')
+  })
+
+  it('records a bulk update of a read-restricted field per record, and leaves it out where only a readable field changed', async () => {
+    const a = await newEntry({ staffNote: 'a' })
+    const b = await newEntry({ staffNote: 'b' })
+    await payload.update({ collection: 'studbook-entries', where: { id: { in: [a.id, b.id] } }, data: { staffNote: 'bulk' } as never, ...(await as(admin)) })
+    for (const x of [a, b]) expect((await latestFor(x.id)).changedFields).toEqual(['staffNote'])
+    await payload.update({ collection: 'studbook-entries', where: { id: { in: [a.id, b.id] } }, data: { notes: 'bulk notes' } as never, ...(await as(admin)) })
+    for (const x of [a, b]) expect((await latestFor(x.id)).changedFields).toEqual(['notes'])
+  })
+
+  it('decides a password changed from the stored hash, not the caller’s data', async () => {
+    const u = (await payload.create({ collection: 'users', data: { email: 'hashed@example.invalid', password: 'Made-up-hashed-pass-1', role: 'member' } as never })) as unknown as U
+    // A hook strips it: only what really changed is listed, and with nothing changed, nothing is recorded.
+    await payload.update({ collection: 'users', id: u.id, data: { name: 'Same', password: 'Made-up-stripped-pass-2' } as never, ...(await as(admin, { stripPassword: true })) })
+    expect((await accountUpdates(u.id))[0]!.changedFields).toEqual(['name'])
+    await payload.update({ collection: 'users', id: u.id, data: { password: 'Made-up-stripped-pass-2' } as never, ...(await as(admin, { stripPassword: true })) })
+    expect((await accountUpdates(u.id)).length).toBe(1)
+    // A hook sets it: recorded by name.
+    await payload.update({ collection: 'users', id: u.id, data: { name: 'Set by a hook' } as never, ...(await as(admin, { setPassword: 'Made-up-hooked-pass-3' })) })
+    expect((await accountUpdates(u.id))[0]!.changedFields).toEqual(['name', 'password'])
+    expect(await everythingStored()).not.toContain('Made-up-hooked-pass-3')
+  })
+
+  it('records no password change for a sign-in after a failed reset on the same request', async () => {
+    const u = (await payload.create({ collection: 'users', data: { email: 'failed-reset@example.invalid', password: 'Made-up-failed-reset-1', role: 'member' } as never })) as unknown as U
+    const n = (await accountUpdates(u.id)).length
+    const { req } = await as(null)
+    await expect(payload.resetPassword({ collection: 'users', data: { token: 'not-a-real-token', password: 'Made-up-never-set-2' }, overrideAccess: true, req })).rejects.toThrow()
+    await payload.login({ collection: 'users', data: { email: 'failed-reset@example.invalid', password: 'Made-up-failed-reset-1' }, req })
+    expect((await accountUpdates(u.id)).length).toBe(n)
+  })
+})
+
+describe('per-write state (the site lead’s audit, PR #117)', () => {
+  it('two concurrent writes sharing one context object each record their own fields', async () => {
+    const shared = {}
+    const [a, b] = (await Promise.all([
+      payload.create({ collection: 'users', data: { email: 'shared-a@example.invalid', password: 'Made-up-shared-pass-1', tier: 'gold' } as never, context: shared }),
+      payload.create({ collection: 'users', data: { email: 'shared-b@example.invalid', password: 'Made-up-shared-pass-2', name: 'B' } as never, context: shared }),
+    ])) as unknown as U[]
+    expect((await latestFor(a!.id)).changedFields).toEqual(['email', 'password', 'tier'])
+    expect((await latestFor(b!.id)).changedFields).toEqual(['email', 'name', 'password'])
+    const x = await newEntry({ staffNote: 'x' })
+    const y = await newEntry({ hiddenNote: 'y' })
+    await Promise.all([
+      payload.update({ collection: 'studbook-entries', id: x.id, data: { staffNote: 'x2' } as never, ...(await as(admin)), context: shared } as never),
+      payload.update({ collection: 'studbook-entries', id: y.id, data: { notes: 'y2' } as never, ...(await as(admin)), context: shared } as never),
+    ])
+    expect((await latestFor(x.id)).changedFields).toEqual(['staffNote'])
+    expect((await latestFor(y.id)).changedFields).toEqual(['notes'])
+  })
+
+  it('a nested write inside a hook doesn’t clobber the outer one', async () => {
+    const outer = await newEntry({ staffNote: 'o1' })
+    const inner = await newEntry({ hiddenNote: 'i1' })
+    await payload.update({ collection: 'studbook-entries', id: outer.id, data: { staffNote: 'o2' } as never, overrideAccess: false, user: { ...admin, collection: 'users' } as never, context: { nestedFrom: outer.id, nestedTo: inner.id } })
+    expect((await latestFor(inner.id)).changedFields).toEqual(['hiddenNote'])
+    expect((await latestFor(outer.id)).changedFields).toEqual(['staffNote'])
+  })
+
+  it('records a successful reset once; a plain sign-in records nothing', async () => {
+    await payload.create({ collection: 'users', data: { email: 'reset-once@example.invalid', password: 'Made-up-reset-once-1' } as never })
+    const id = String((await payload.find({ collection: 'users', where: { email: { equals: 'reset-once@example.invalid' } }, overrideAccess: true })).docs[0]!.id)
+    await payload.login({ collection: 'users', data: { email: 'reset-once@example.invalid', password: 'Made-up-reset-once-1' } })
+    expect((await accountUpdates(id)).length).toBe(0)
+    const token = await payload.forgotPassword({ collection: 'users', data: { email: 'reset-once@example.invalid' }, disableEmail: true })
+    await payload.resetPassword({ collection: 'users', data: { token: String(token), password: 'Made-up-reset-once-2' }, overrideAccess: true })
+    expect((await accountUpdates(id)).map((e) => e.changedFields)).toEqual([['password']])
   })
 })
