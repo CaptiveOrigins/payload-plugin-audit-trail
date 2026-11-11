@@ -207,7 +207,7 @@ After the third read (approved f8cdfb4), 79 tests: "two nested writes to one rec
 
 ## 2026-11-11: verify a page at a time (K33)
 
-Baseline 79 tests, now 106: 27 in `test/verify-stream.test.ts` (22 for streaming, 5 for the prune fix below), on the same in-memory MongoDB replica set. `test/legacy-verify.ts` is the old verify, word for word; "agrees" below means the streaming verify's `ok`, `checked`, `firstBreak` and `warnings` equal its answer at page sizes 1, 2, 3 and 1,000.
+Baseline 79 tests, now 110: 31 in `test/verify-stream.test.ts` (22 for streaming, 5 for the prune fix and 4 for the security read's shoulds, both below), on the same in-memory MongoDB replica set. `test/legacy-verify.ts` is the old verify, word for word; "agrees" below means the streaming verify's `ok`, `checked`, `firstBreak` and `warnings` equal its answer at page sizes 1, 2, 3 and 1,000.
 
 | Promise | Test |
 | --- | --- |
@@ -292,3 +292,24 @@ The three tests in "pruning more than once" were written first and failed on 6a7
 - A database writer who appends a made-up checkpoint at the newest end and moves the seal head: verify can't catch that, as with any consistent rewrite. The README says `onSeal` is the defense.
 - A trail pruned by a build from before this change: it reports a link break by design; nothing was published with that format.
 - A prune racing a seal: the checkpoint is written with the conditional seal head, as before ("two seals at once…").
+
+## 2026-11-11: the security read of 8a3bebb (K33, third pass)
+
+Four tests in "after the security read of 8a3bebb", each written first and failing on 8a3bebb. 110 tests in all.
+
+| Promise | Test |
+| --- | --- |
+| A seal head with no seals is a break, also with a sealed record removed; with the head gone too a full verify passes (the stated limit) and a check `from` a kept digest fails | "a seal head with no seals is a break…" |
+| From the second checkpoint, a surviving seal that links to the first verifies, as in a full check; that seal removed, or the first checkpoint removed, is still a break | "a check from the second checkpoint agrees with a full one…" |
+| The result names every cut (seq, digest, upTo, pins, written), in the summary too; a forged checkpoint appended with the head moved is on the list and isn't one `onSeal` gave | "names every cut it read…" |
+| Prune refuses on a break or an unfinished verify and changes nothing; `verify: false` prunes; clearing values alone doesn't check | "prune refuses to cut a trail that doesn't verify…" |
+
+Two older tests now pass `verify: false`, each with its reason beside it: both prune a trail the test itself made unverifiable (hashes broken by backdating; a seal made an hour ahead by a fake clock).
+
+**Mutation check**, in a copy of the repo. All 7 made a test fail: a seal head with no seals passing; from a checkpoint, seals read only from the checkpoint on; cuts not listed; cuts left out of the summary; prune going ahead on a failed verify; `verify: false` ignored; prune checking when only clearing values.
+
+**Gaps skipped, and why:**
+
+- Every seal and the seal head removed: a full verify can't see it, by design; the README says to keep a digest elsewhere. Tested as the limit it is.
+- A forged checkpoint: verify passes it, by design; the test shows it listed in `cuts`.
+- The cost of prune's full verify on a very large trail: a site's timing test.

@@ -752,3 +752,98 @@ describe('pruning more than once', () => {
     expect((await agree()).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
   })
 })
+
+describe('after the security read of 8a3bebb', () => {
+  it('a seal head with no seals is a break; with the head gone too, only a check from a kept digest notices', async () => {
+    const { d, s1 } = await story()
+    await raw(SEALS).deleteMany({})
+    expect((await agree()).firstBreak).toEqual({ id: '__seal__', reason: 'every seal is missing, while the seal head is still here' })
+    await raw(EVENTS).deleteMany({ chainKey: `notes:${d.id}` })
+    await raw(HEADS).deleteOne({ key: `notes:${d.id}` })
+    expect((await agree()).firstBreak?.reason).toBe('every seal is missing, while the seal head is still here')
+    // The stated limit: nothing in the database says there were ever seals.
+    await raw(HEADS).deleteOne({ key: '__seal__' })
+    expect((await agree()).ok).toBe(true)
+    expect(await verifyAuditTrail(p, { from: s1.digest })).toMatchObject({ ok: false, finished: false, firstBreak: { reason: expect.stringMatching(/was not found/) } })
+  })
+
+  it('a check from the second checkpoint agrees with a full one when a surviving seal links to the first', async () => {
+    await make('first')
+    const s1 = await sealNow()
+    await make('second')
+    const s2 = await sealNow()
+    await pruneAuditTrail(p, { olderThanDays: 0, now: new Date(new Date(s1.upTo).getTime() + 1) })
+    const kept = await make('third')
+    await sealNow()
+    await pruneAuditTrail(p, { olderThanDays: 0, now: new Date(new Date(s2.upTo).getTime() + 1) })
+    expect((await seals()).map((s) => `${s.seq} ${s.kind}`)).toEqual(['3 checkpoint', '4 seal', '5 checkpoint'])
+    const c2 = sealed.at(-1)!
+    expect(c2.kind).toBe('checkpoint')
+    expect(await verifyAuditTrail(p)).toMatchObject({ ok: true, checked: 1 })
+    for (const pageSize of [1, 1000]) expect(await verifyAuditTrail(p, { from: c2.digest, pageSize })).toMatchObject({ ok: true, checked: 1, partial: true, range: { from: { kind: 'checkpoint', seq: 5 } } })
+    // Still closed: the surviving seal removed with its record, or the first checkpoint swapped for another.
+    const s4 = (await seals())[1]!
+    await raw(SEALS).deleteOne({ seq: 4 })
+    await raw(EVENTS).deleteMany({ chainKey: `notes:${kept.id}` })
+    await raw(HEADS).deleteOne({ key: `notes:${kept.id}` })
+    expect((await verifyAuditTrail(p, { from: c2.digest })).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
+    await raw(SEALS).insertOne({ ...s4, _id: undefined, id: undefined, upTo: new Date(s4.upTo), fromAt: new Date(s4.fromAt) })
+    await raw(SEALS).deleteOne({ seq: 3 })
+    expect((await verifyAuditTrail(p, { from: c2.digest })).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
+  })
+
+  it('names every cut it read, so one nobody made stands out', async () => {
+    expect((await verifyAuditTrail(p)).cuts).toEqual([])
+    const before = sealed.length
+    const { a, b, c, s1, s2, chain } = await story()
+    await pruneAuditTrail(p, { olderThanDays: 0, now: new Date(new Date(s1.upTo).getTime() + 1) })
+    const mine = sealed.slice(before).filter((s) => s.kind === 'checkpoint')
+    const [first] = (await seals()).filter((s) => s.kind === 'checkpoint')
+    const honest = await verifyAuditTrail(p)
+    expect(honest).toMatchObject({ ok: true, cuts: [{ seq: 4, digest: mine[0]!.digest, upTo: new Date(s1.upTo).toISOString(), pins: [s1.digest], written: first!.createdAt }] })
+    expect(honest.cuts).toHaveLength(1)
+    expect(honest.summary).toMatch(/It read 1 cut \(a checkpoint from a prune\): seq 4, up to .*Z\. A cut you didn’t make means tampering\.$/)
+    // Someone removes seal 2 and what it sealed, then appends a well-formed checkpoint and moves the seal head.
+    await raw(SEALS).deleteOne({ digest: s2.digest })
+    for (const id of [b.id, c.id]) {
+      const gone = (await chain(id)).filter((e) => e.at > new Date(s1.upTo).toISOString() && e.at <= new Date(s2.upTo).toISOString())
+      expect(gone.length).toBeGreaterThan(0)
+    }
+    await raw(EVENTS).deleteMany({ chainKey: `notes:${c.id}`, seq: 1 })
+    const tip = (await seals()).at(-1)!
+    const upTo = new Date(s2.upTo)
+    const forged = sealDigest(tip.digest, [s2.digest], upTo.toISOString(), 'checkpoint')
+    await raw(SEALS).insertOne({ kind: 'checkpoint', seq: tip.seq + 1, prevDigest: tip.digest, digest: forged, upTo, count: 0, pins: [s2.digest] })
+    await raw(HEADS).updateOne({ key: '__seal__' }, { $set: { hash: forged } })
+    const after = await verifyAuditTrail(p)
+    // Whether or not the entries' own chains give it away, the cut is on the list, and it isn't one of the site's.
+    expect(after.cuts.map((x) => x.digest)).toEqual([mine[0]!.digest, forged])
+    expect(after.cuts.filter((x) => !mine.some((m) => m.digest === x.digest))).toMatchObject([{ seq: tip.seq + 1, pins: [s2.digest], upTo: upTo.toISOString() }])
+    expect((await verifyAuditTrail(p, { from: mine[0]!.digest })).cuts.map((x) => x.digest)).toEqual([mine[0]!.digest, forged])
+    void a
+  })
+
+  it('prune refuses to cut a trail that doesn’t verify, unless told not to check', async () => {
+    const { a, s1, chain } = await story()
+    const first = (await chain(a.id))[0]!
+    await raw(EVENTS).updateOne({ hash: first.hash }, { $set: { reason: 'made up' } })
+    const cut = { olderThanDays: 0, valuesOlderThanDays: 0, now: new Date(new Date(s1.upTo).getTime() + 1) }
+    await expect(pruneAuditTrail(p, cut)).rejects.toThrow(/verify found a break.*changed after it was written.*Nothing was pruned/)
+    expect(await trail()).toHaveLength(10)
+    expect((await trail()).some((e) => e.values)).toBe(true)
+    expect((await seals()).map((s) => s.kind)).toEqual(['seal', 'seal', 'seal'])
+    // A read that fails is no pass either.
+    vi.spyOn(p, 'count').mockRejectedValueOnce(new Error('made up'))
+    await raw(EVENTS).updateOne({ hash: first.hash }, { $unset: { reason: '' } })
+    await expect(pruneAuditTrail(p, cut)).rejects.toThrow(/Nothing was pruned/)
+    vi.restoreAllMocks()
+    await raw(EVENTS).updateOne({ hash: first.hash }, { $set: { reason: 'made up' } })
+    expect(await pruneAuditTrail(p, { ...cut, verify: false })).toMatchObject({ deleted: 4 })
+    expect((await verifyAuditTrail(p)).ok).toBe(true)
+    // Clearing values alone cuts nothing, so it doesn't check.
+    const kept = (await trail())[0]!
+    await raw(EVENTS).updateOne({ hash: kept.hash }, { $set: { reason: 'made up' } })
+    await expect(pruneAuditTrail(p, { valuesOlderThanDays: 0 })).resolves.toMatchObject({ deleted: 0 })
+  })
+})

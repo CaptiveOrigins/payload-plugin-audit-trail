@@ -5,8 +5,8 @@ import { entryHash, SEAL_KEY, sealDigest, valuesHash } from '../src/chain.js'
 /**
  * The verify this plugin shipped before it streamed (K33), kept as a reference: it reads the whole trail into
  * memory. The streaming verify must give the same answer on every trail these tests build. It is word for word
- * the old one except for the seal-link rule, which changed for both when a second prune was found to leave a
- * false break (a seal whose predecessor is gone must be pinned by a checkpoint).
+ * the old one except for two rules that changed for both: a seal whose predecessor is gone must be pinned by a
+ * checkpoint (a second prune used to leave a false break), and a seal head with no seals is a break.
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export type LegacyResult = { ok: boolean; checked: number; firstBreak?: { id: string; reason: string }; warnings: string[] }
@@ -93,6 +93,7 @@ export async function legacyVerify(payload: Payload, args: { since?: Date; now?:
   }
   const sealHead = (await allSorted(payload, o.heads, { key: { equals: SEAL_KEY } }))[0] as { hash: string } | undefined
   if (prevSeal && sealHead?.hash !== prevSeal.digest) return fail(prevSeal.id, 'the newest seal is missing or changed', checked)
+  if (!prevSeal && sealHead) return fail(SEAL_KEY, 'every seal is missing, while the seal head is still here', checked)
   // 4. Warnings, not breaks: entries waiting longer than an interval for a seal.
   const sealedTo = prevSeal?.upTo ?? null
   const overdue = new Date(now.getTime() - (o.sealEveryHours * 60 + o.sealGraceMinutes) * 60_000).toISOString()

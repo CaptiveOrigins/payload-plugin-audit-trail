@@ -171,7 +171,7 @@ describe('seals', () => {
     await raw(p, 'audit-events').updateMany({}, { $set: { at: old } })
     await raw(p, 'audit-events-heads').updateMany({}, { $set: { at: old } })
     await sealAuditTrail(p, { upTo: new Date(Date.now() - 2 * 86_400_000) })
-    const r = await pruneAuditTrail(p, { olderThanDays: 1 })
+    const r = await pruneAuditTrail(p, { olderThanDays: 1, verify: false })
     expect(r.deleted).toBeGreaterThan(0)
     await edit(p, a.id, { text: 'after the cut' })
     await edit(p, a.id, { text: 'after the cut, again' })

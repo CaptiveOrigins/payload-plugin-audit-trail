@@ -474,10 +474,17 @@ export async function adoptExistingEntries(payload: Payload): Promise<{ adopted:
  * Deletes and clears by age, for the site's job (no timers inside). `valuesOlderThanDays` clears logged values and
  * keeps the entries (their chain is unchanged: values have their own hash). `olderThanDays` first writes a
  * checkpoint seal recording the cut, then deletes entries and seals before it. With neither, nothing happens.
+ *
+ * Before `olderThanDays` cuts anything it runs a full verify, and refuses if that finds a break or can't finish:
+ * tampering in a range can't be found once the range is gone. `verify: false` skips the check.
  */
-export async function pruneAuditTrail(payload: Payload, args: { olderThanDays?: number; valuesOlderThanDays?: number; now?: Date } = {}) {
+export async function pruneAuditTrail(payload: Payload, args: { olderThanDays?: number; valuesOlderThanDays?: number; now?: Date; verify?: boolean } = {}) {
   const o = optionsOf(payload)
   const now = args.now ?? new Date()
+  if (args.olderThanDays !== undefined && args.verify !== false) {
+    const check = await verifyAuditTrail(payload, { now })
+    if (!check.ok) throw new Error(`audit-trail: verify found a break before pruning (${check.firstBreak ? `${check.firstBreak.id}: ${check.firstBreak.reason}` : 'it did not finish'}). Nothing was pruned: what a cut removes can't be checked afterwards. Look into it, or pass { verify: false } to prune anyway.`)
+  }
   const before = (days: number) => new Date(now.getTime() - days * 86_400_000).toISOString()
   let valuesCleared = 0
   let deleted = 0
@@ -544,6 +551,9 @@ export type VerifyRange = {
   read: number
 }
 
+/** A cut a prune recorded (a checkpoint). `written` is the database's own timestamp, which nothing protects; the rest is covered by the checkpoint's digest. */
+export type VerifyCut = { seq: number; digest: string; upTo: string; pins: string[]; written: string | null }
+
 export type VerifyResult = {
   /** True only when everything asked for was read and nothing was wrong. A run that stopped early is never ok. */
   ok: boolean
@@ -557,6 +567,11 @@ export type VerifyResult = {
   /** True when this result doesn't speak for the whole trail: it started `from` a seal, or didn't finish. */
   partial: boolean
   range: VerifyRange
+  /**
+   * Every cut this check read, oldest first: entries up to `upTo` were removed, along with the seals whose digests
+   * are in `pins`. Match each to a prune you ran (its digest went to `onSeal`). One you didn't make means tampering.
+   */
+  cuts: VerifyCut[]
   /** What was checked, in a sentence, for logs and people. */
   summary: string
 }
@@ -599,6 +614,7 @@ export async function verifyAuditTrail(payload: Payload, args: VerifyArgs = {}):
   let read = 0
   let sealsRead = 0
   let stopped = false
+  const cuts: VerifyCut[] = []
 
   const result = (ok: boolean, finished: boolean, firstBreak?: { id: string; reason: string }): VerifyResult => {
     range.read = read
@@ -612,7 +628,9 @@ export async function verifyAuditTrail(payload: Payload, args: VerifyArgs = {}):
       : !finished
         ? `Not finished: stopped after ${n(read)} entr${read === 1 ? 'y' : 'ies'}${f ? ` written after ${since}` : ''}, as asked. No break so far, but the rest of the entries, their heads and the seals were not checked.${left}`
         : `No break in ${scope}.${left}`
-    return { ok, checked, ...(firstBreak ? { firstBreak } : {}), warnings, finished, partial: Boolean(f) || !finished, range, summary }
+    const shown = cuts.slice(-3).map((c) => `seq ${c.seq}, up to ${c.upTo}`).join('; ')
+    const cutNote = cuts.length ? ` It read ${n(cuts.length)} cut${cuts.length === 1 ? ' (a checkpoint from a prune)' : 's (checkpoints from prunes)'}: ${cuts.length > 3 ? `the newest are ${shown}` : shown}. A cut you didn’t make means tampering.` : ''
+    return { ok, checked, ...(firstBreak ? { firstBreak } : {}), warnings, finished, partial: Boolean(f) || !finished, range, cuts, summary: summary + cutNote }
   }
 
   /** One bounded read. A failed read, or one longer than asked, ends the verification where it stood. */
@@ -717,12 +735,10 @@ export async function verifyAuditTrail(payload: Payload, args: VerifyArgs = {}):
       anchor = found[0]!
       if (anchor.kind !== 'seal' && anchor.kind !== 'checkpoint') throw new Stop(digest, 'verify can start from a seal or a checkpoint, not from an adoption seal', false)
       after = new Date(anchor.upTo).toISOString()
-      walkFrom = anchor.seq
-      if (anchor.kind === 'checkpoint') {
-        // Seals written before the checkpoint can end after its cut. Their entries are in range, so they're recomputed too.
-        const earlier = (await find('the seals', o.seals, { and: [{ kind: { equals: 'seal' } }, { upTo: { greater_than: after } }] }, ['seq'], 1))[0]
-        if (earlier && earlier.seq < walkFrom) walkFrom = earlier.seq
-      }
+      // From a seal, the seals are read from that seal on. From a checkpoint, all of them are: seals written before
+      // it can end after its cut, with their entries in range, and they may link to an older checkpoint. What's
+      // left before a cut is only older checkpoints and seals still in range, so this costs little.
+      walkFrom = anchor.kind === 'seal' ? anchor.seq : null
       range.from = { kind: anchor.kind, seq: anchor.seq, digest: anchor.digest, upTo: after }
       range.skipped = await count('the entries before the seal to start from', { at: { less_than_equal: after } })
     }
@@ -825,13 +841,14 @@ export async function verifyAuditTrail(payload: Payload, args: VerifyArgs = {}):
       // Each seal links to the one before it. Where that one is gone, a checkpoint from here on must have recorded
       // cutting it away (its digest among the checkpoint's pins, which the checkpoint's own digest covers). Only
       // the trail's very first seal links to nothing, and the seal a `from` check starts at is taken as given.
-      const start = prevSeal ? false : anchor ? String(s.id) === String(anchor.id) : !s.prevDigest
+      const start = prevSeal ? false : walkFrom !== null ? String(s.id) === String(anchor!.id) : !s.prevDigest
       if (!start && !(prevSeal && s.prevDigest === prevSeal.digest)) {
         const pinned = s.prevDigest ? await find(`the seal before seal ${s.seq}`, o.seals, { and: [{ kind: { equals: 'checkpoint' } }, { pins: { in: [s.prevDigest] } }, { seq: { greater_than_equal: s.seq } }] }, ['seq'], 1) : []
         if (!pinned.length) throw new Stop(String(s.id), 'a seal doesn’t link to the seal before it')
       }
       if (s.kind === 'checkpoint') {
         if (sealDigest(s.prevDigest ?? null, s.pins ?? [], s.upTo, 'checkpoint') !== s.digest) throw new Stop(String(s.id), 'a checkpoint was changed')
+        cuts.push({ seq: s.seq, digest: s.digest, upTo: new Date(s.upTo).toISOString(), pins: [...(s.pins ?? [])], written: (s as { createdAt?: string }).createdAt ?? null })
       } else if (s.kind === 'adoption') {
         // Once a checkpoint cut past the whole adoption, its entries are gone by design and only the link is checked.
         const prunedPast = checkpoint && checkpoint.upTo >= new Date(s.upTo).toISOString()
@@ -861,6 +878,8 @@ export async function verifyAuditTrail(payload: Payload, args: VerifyArgs = {}):
     }
     const sealHead = (await find('the newest seal', o.heads, { key: { equals: SEAL_KEY } }, ['key'], 1))[0] as { hash: string } | undefined
     if (prevSeal && sealHead?.hash !== prevSeal.digest) throw new Stop(String(prevSeal.id), 'the newest seal is missing or changed')
+    // A head with nothing under it: every seal was removed. (With the head removed too, nothing here says there were any.)
+    if (!prevSeal && sealHead) throw new Stop(SEAL_KEY, 'every seal is missing, while the seal head is still here')
     // 4. Warnings, not breaks: entries waiting longer than an interval for a seal.
     const sealedTo = prevSeal?.upTo ?? null
     const overdue = new Date(now.getTime() - (o.sealEveryHours * 60 + o.sealGraceMinutes) * 60_000).toISOString()

@@ -116,8 +116,9 @@ describe('adopting entries from before chaining', () => {
     const s1 = (await payload.find({ collection: 'audit-events-seals' as never, where: { kind: { equals: 'seal' } } as never, sort: '-seq', limit: 1, overrideAccess: true })).docs[0] as Doc
     const s0 = (await payload.find({ collection: 'audit-events-seals' as never, where: { kind: { equals: 'seal' } } as never, sort: 'seq', limit: 1, overrideAccess: true })).docs[0] as Doc
     expect(new Date(s1.fromAt).toISOString()).toBe(new Date(s0.upTo).toISOString())
-    // Prune at S0's end: S1's range is untouched.
-    await pruneAuditTrail(payload, { olderThanDays: 0, now: new Date(new Date(s0.upTo).getTime() + 1000) })
+    // Prune at S0's end: S1's range is untouched. (No verify first: this test's clock sealed S0 an hour ahead, so
+    // "later" is dated inside S0's range, which a verify before the cut rightly reports.)
+    await pruneAuditTrail(payload, { olderThanDays: 0, verify: false, now: new Date(new Date(s0.upTo).getTime() + 1000) })
     const r = await verifyAuditTrail(payload, { now: new Date(t0 + 2 * DAY) })
     expect(r.firstBreak?.reason ?? null).toBeNull()
   })
