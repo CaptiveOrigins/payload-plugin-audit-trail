@@ -48,7 +48,8 @@ export default buildConfig({
       collections: ['users', 'animals', 'pages'],
       actions: ['masquerade', 'export'],
       access: { read: isAdmin, values: isAdmin },
-      via: ({ req }) => (req.context.switchedFrom ? { kind: 'hats', id: String(req.context.switchedFrom) } : null),
+      // With Hats: which account really signed in, when a hat is worn (import { hatsStateOf } from Hats in your site).
+      via: ({ req }) => { const s = hatsStateOf(req); return s?.via ? { kind: 'hats', id: String(s.via) } : null },
       values: { animals: ['studbookNumber'] },
       personal: ['email', 'name', 'location'],
       onSeal: ({ digest, upTo }) => sendToOwner(`Audit seal ${upTo}: ${digest}`),
