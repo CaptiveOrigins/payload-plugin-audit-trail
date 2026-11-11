@@ -80,6 +80,19 @@ export const valuesHash = (values: unknown) => sha(JSON.stringify(canonical(valu
 
 export const sealDigest = (prevDigest: string | null, hashes: string[], upTo: string, kind = 'seal') => sha(`${prevDigest ?? ''}\n${kind}\n${upTo}\n${hashes.join('\n')}`)
 
+/** The same digest as `sealDigest`, built one hash at a time, so a seal's entries never have to be held together. */
+export function sealHasher(prevDigest: string | null, upTo: string, kind = 'seal') {
+  const running = createHash('sha256').update(`${prevDigest ?? ''}\n${kind}\n${upTo}\n`)
+  let first = true
+  return {
+    add(hash: string) {
+      running.update(first ? hash : `\n${hash}`)
+      first = false
+    },
+    digest: () => running.digest('hex'),
+  }
+}
+
 type HeadDoc = { id: string | number; key: string; hash: string; seq: number; at?: string | null }
 
 export async function readHead(payload: Payload, headsSlug: string, key: string, req?: PayloadRequest): Promise<HeadDoc | null> {

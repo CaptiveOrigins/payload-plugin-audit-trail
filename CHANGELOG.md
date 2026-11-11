@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `verifyAuditTrail` no longer reads the whole trail into memory (K33). It reads a page at a time (`pageSize`, default 1,000), keeps only the running state, and gives the same answer as before for every case tested. A read that fails, returns more than asked or comes back out of order now gives a failed result naming the place (`ok: false, finished: false`) where a failed read used to throw. Existing calls work unchanged.
+- New verify options: `from` (a seal's or checkpoint's digest: check only what was written after it), `stopAfter` (stop after that many entries; the result is not finished, never ok) and `onProgress`. The result gains `finished`, `partial`, `range` and `summary`, so a partial check can't be read as a full one.
+- The trail gets a compound index on `chainKey` and `seq`, which verify's paging sorts by.
 - Setting a password (create, update, or a reset by emailed link) records `password` by name, when the stored hash or salt changed. They're never listed, so it used to leave no entry. Found by the Captive Origins site (K428); its tests are ported.
 - A hidden or read-restricted field no longer shows as changed on every update. It's compared as stored, read inside the write's transaction before and after, so a change made by a site hook or a restore is still recorded and an unchanged one isn't. Only digests are kept, in memory, per request and per write (a stack, so nested and concurrent writes don't mix), never in `req.context`.
 - Several writes at once on one request (a hook fanning out updates) each keep their own reading, keyed by record. An update whose earlier reading is missing fails, or with `onWriteError: 'log'` is logged and recorded from the saved copies; it's never guessed quietly.

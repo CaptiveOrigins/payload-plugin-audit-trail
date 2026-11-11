@@ -15,7 +15,7 @@ import type {
   Plugin,
 } from 'payload'
 
-import { canonical, entryHash, moveHead, readHead, SEAL_KEY, sealDigest, valuesHash } from './chain.js'
+import { canonical, entryHash, moveHead, readHead, SEAL_KEY, sealDigest, sealHasher, valuesHash } from './chain.js'
 
 /**
  * Audit trail for Payload: who changed which fields of which record, from where and through whom, never the
@@ -506,89 +506,354 @@ export async function pruneAuditTrail(payload: Payload, args: { olderThanDays?: 
   return { valuesCleared, deleted }
 }
 
-export type VerifyResult = { ok: boolean; checked: number; firstBreak?: { id: string; reason: string }; warnings: string[] }
+export type VerifyArgs = {
+  /** Recompute hashes only for entries from this date on (links and heads are still checked for all of them). */
+  since?: Date
+  now?: Date
+  /** How many entries, heads or seals one query reads. Verify never holds more than this (plus one) at a time. Default 1,000. */
+  pageSize?: number
+  /**
+   * The digest of a seal or checkpoint you've already verified, as `onSeal` gave it: check only what was written
+   * after it. That seal is recomputed first, so its end can't be moved. The result is marked `partial`.
+   */
+  from?: string
+  /** Stop once this many entries have been read and more remain. The result is then `finished: false`, never ok. */
+  stopAfter?: number
+  /** Called after each page of entries, and after each seal. If it throws, verify throws. */
+  onProgress?: (progress: VerifyProgress) => unknown
+}
+
+export type VerifyProgress = { phase: 'entries' | 'seals'; read: number; checked: number; seals: number }
+
+export type VerifyRange = {
+  /** The seal or checkpoint the check started from. Null when it started at the beginning of the trail. */
+  from: { kind: 'seal' | 'checkpoint'; seq: number; digest: string; upTo: string } | null
+  /** Entries dated up to `from`, which this run did not read. 0 without `from`. */
+  skipped: number
+  /** Entries this run read. */
+  read: number
+}
+
+export type VerifyResult = {
+  /** True only when everything asked for was read and nothing was wrong. A run that stopped early is never ok. */
+  ok: boolean
+  /** Entries whose hash was recomputed. */
+  checked: number
+  /** The first break, or where a read failed. */
+  firstBreak?: { id: string; reason: string }
+  warnings: string[]
+  /** False when it stopped before reaching a verdict: `stopAfter` was reached, or the trail couldn't be read. */
+  finished: boolean
+  /** True when this result doesn't speak for the whole trail: it started `from` a seal, or didn't finish. */
+  partial: boolean
+  range: VerifyRange
+  /** What was checked, in a sentence, for logs and people. */
+  summary: string
+}
+
+/** Thrown inside verify to end it: a break (`finished`), or a read that can't be trusted (`finished: false`). */
+class Stop extends Error {
+  constructor(
+    readonly id: string,
+    readonly reason: string,
+    readonly finished = true,
+  ) {
+    super(reason)
+  }
+}
+
+const OUT_OF_ORDER = 'the trail came back out of order here, so nothing past this point was checked'
+const byAtThenId = (a: Record<string, any>, b: Record<string, any>) => (a.at < b.at ? -1 : a.at > b.at ? 1 : String(a.id) < String(b.id) ? -1 : 1)
+const allOf = (parts: Record<string, unknown>[]) => (parts.length ? { and: parts } : {})
+const hashedWhere = [{ hash: { exists: true } }, { hash: { not_equals: '' } }]
 
 /**
  * Recomputes every entry's hash and its link to the entry before it in its record's chain, checks each chain's head
  * against its newest entry, and recomputes every seal. Reports the first break; never guesses. `since` limits the
  * entries whose hashes are recomputed (links and heads are still checked).
+ *
+ * It reads the trail a page at a time (`pageSize`) and keeps only the running state: the entry before, the chains
+ * a page finished, a seal's running digest. Anything it can't read, or that comes back out of order or longer than
+ * asked, is a failed verification with the position, never a pass. `from` checks only what follows a seal you
+ * verified before, and `stopAfter` stops early; both say so in the result (`partial`, `finished`, `range`, `summary`).
  */
-export async function verifyAuditTrail(payload: Payload, args: { since?: Date; now?: Date } = {}): Promise<VerifyResult> {
+export async function verifyAuditTrail(payload: Payload, args: VerifyArgs = {}): Promise<VerifyResult> {
   const o = optionsOf(payload)
   const now = args.now ?? new Date()
+  const size = args.pageSize ?? 1000
+  if (!Number.isInteger(size) || size < 1) throw new RangeError('audit-trail: pageSize must be a whole number, 1 or more.')
+  if (args.stopAfter !== undefined && (!Number.isInteger(args.stopAfter) || args.stopAfter < 1)) throw new RangeError('audit-trail: stopAfter must be a whole number, 1 or more.')
   const warnings: string[] = []
-  const fail = (id: unknown, reason: string, checked: number): VerifyResult => ({ ok: false, checked, firstBreak: { id: String(id), reason }, warnings })
-  const all = (await allSorted(payload, o.slug, {}, ['chainKey', 'seq'])) as Entry[]
-  const seals = (await allSorted(payload, o.seals, {}, ['seq'])) as unknown as Seal[]
-  const checkpoint = [...seals].reverse().find((s) => s.kind === 'checkpoint') ?? null
-  // Entries with no hash were written before chaining. They're allowed only inside the adoption seal's range.
-  const adoption = seals.find((s) => s.kind === 'adoption') ?? null
-  const entries = all.filter((e) => e.hash)
-  const unhashed = all.filter((e) => !e.hash).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : String(a.id) < String(b.id) ? -1 : 1)) as Record<string, any>[]
-  for (const e of unhashed) {
-    if (e.values && (!e.valuesHash || valuesHashOf(e.values) !== e.valuesHash)) return fail(e.id, 'its logged values were changed', 0)
-    if (!adoption) return fail(e.id, 'an entry has no hash and there is no adoption seal (it was written outside the plugin, or adoptExistingEntries hasn\u2019t run)', 0)
-    if (new Date(e.at).toISOString() > adoption.upTo) return fail(e.id, 'an entry has no hash and was written after the adoption seal (something wrote around the plugin)', 0)
-  }
-  const since = args.since?.toISOString()
+  const range: VerifyRange = { from: null, skipped: 0, read: 0 }
   let checked = 0
-  // 1. Each record's chain: hashes, links, no gaps.
-  const lastByChain = new Map<string, Entry>()
-  for (const e of entries) {
-    const prev = lastByChain.get(e.chainKey)
-    if (!since || e.at >= since) {
-      checked++
-      const extra = Object.fromEntries(o.extraNames.filter((k) => e[k] !== undefined).map((k) => [k, e[k]]))
-      if (entryHash({ ...(e as unknown as Parameters<typeof entryHash>[0]), extra }) !== e.hash) return fail(e.id, 'the entry was changed after it was written', checked)
-      if (e.values && e.valuesHash && valuesHashOf(e.values) !== e.valuesHash) return fail(e.id, 'its logged values were changed', checked)
-    }
-    if (prev) {
-      if (e.seq !== prev.seq + 1) return fail(e.id, `an entry before it in ${e.chainKey} is missing`, checked)
-      if (e.prevHash !== prev.hash) return fail(e.id, `it doesn't link to the entry before it in ${e.chainKey}`, checked)
-    } else if (e.seq !== 1 && !(checkpoint && e.prevAt && new Date(e.prevAt).toISOString() <= checkpoint.upTo)) {
-      // A chain may start mid-way only where a checkpoint recorded the cut, and only if what's gone was from before it.
-      return fail(e.id, `the start of ${e.chainKey} is missing`, checked)
-    } else if (e.seq === 1 && e.prevHash) return fail(e.id, 'a first entry links to something', checked)
-    lastByChain.set(e.chainKey, e)
+  let read = 0
+  let sealsRead = 0
+  let stopped = false
+
+  const result = (ok: boolean, finished: boolean, firstBreak?: { id: string; reason: string }): VerifyResult => {
+    range.read = read
+    const n = (v: number) => v.toLocaleString('en-US')
+    const f = range.from
+    const since = f ? `${f.kind} ${f.seq} (up to ${f.upTo})` : ''
+    const left = f ? ` The ${n(range.skipped)} entr${range.skipped === 1 ? 'y' : 'ies'} up to it ${range.skipped === 1 ? 'was' : 'were'} not checked.` : ''
+    const scope = !f ? `all ${n(read)} entr${read === 1 ? 'y' : 'ies'}` : read ? `entries ${n(range.skipped + 1)}–${n(range.skipped + read)} in time order, written after ${since}` : `the trail after ${since}, where no entries were written`
+    const summary = firstBreak
+      ? `${finished ? 'Break' : 'Not finished: failed'} at ${firstBreak.id}: ${firstBreak.reason}. Read ${n(read)} entr${read === 1 ? 'y' : 'ies'}${f ? ` written after ${since}` : ''} before that.${left}`
+      : !finished
+        ? `Not finished: stopped after ${n(read)} entr${read === 1 ? 'y' : 'ies'}${f ? ` written after ${since}` : ''}, as asked. No break so far, but the rest of the entries, their heads and the seals were not checked.${left}`
+        : `No break in ${scope}.${left}`
+    return { ok, checked, ...(firstBreak ? { firstBreak } : {}), warnings, finished, partial: Boolean(f) || !finished, range, summary }
   }
-  // 2. Heads: each chain's newest entry must be the one its head points to (an entry deleted after its last seal shows here).
-  const heads = (await allSorted(payload, o.heads, { key: { not_equals: SEAL_KEY } }, ['key'])) as unknown as { key: string; hash: string; seq: number; at?: string }[]
-  for (const h of heads) {
-    const last = lastByChain.get(h.key)
-    if (!last) {
-      if (checkpoint && h.at && h.at < checkpoint.upTo) continue // the whole chain was pruned
-      return fail(h.key, 'every entry of this chain is missing', checked)
+
+  /** One bounded read. A failed read, or one longer than asked, ends the verification where it stood. */
+  const find = async (at: string, slug: string, where: Record<string, unknown>, sort: string[], limit: number) => {
+    let docs: unknown
+    try {
+      docs = (await payload.find({ collection: slug as never, where: where as never, sort, limit, pagination: false, depth: 0, overrideAccess: true, showHiddenFields: true })).docs
+    } catch (error) {
+      // The name only: a message can carry details of the query.
+      throw new Stop(at, `the trail couldn't be read here (${(error as Error | undefined)?.name ?? typeof error}), so nothing past this point was checked`, false)
     }
-    if (last.hash !== h.hash || last.seq !== h.seq) return fail(last.id, `the newest entries of ${h.key} are missing or changed`, checked)
+    if (!Array.isArray(docs) || docs.length > limit) throw new Stop(at, 'a read returned more than it was asked for, so nothing past this point was checked', false)
+    return docs as Record<string, any>[]
   }
-  for (const key of lastByChain.keys()) if (!heads.some((h) => h.key === key)) return fail(key, 'this chain has no head (it was added outside the plugin)', checked)
-  // 3. Seals: each digest from the entries in its range, each linked to the one before.
-  let prevSeal: Seal | null = null
-  for (const s of seals) {
-    if (prevSeal && s.prevDigest !== prevSeal.digest) return fail(s.id, 'a seal doesn’t link to the seal before it', checked)
-    if (s.kind === 'checkpoint') {
-      if (sealDigest(s.prevDigest ?? null, [], s.upTo, 'checkpoint') !== s.digest) return fail(s.id, 'a checkpoint was changed', checked)
-    } else if (s.kind === 'adoption') {
-      // Once a checkpoint cut past the whole adoption, its entries are gone by design and only the link is checked.
-      const prunedPast = checkpoint && checkpoint.upTo >= new Date(s.upTo).toISOString()
-      if (prunedPast) {
-        if (unhashed.length) return fail(unhashed[0]!.id, 'an adopted entry is still here after the cut that should have removed it', checked)
-      } else if (unhashed.length !== s.count || sealDigest(s.prevDigest ?? null, unhashed.map(adoptedHash), new Date(s.upTo).toISOString(), 'adoption') !== s.digest)
-        return fail(s.id, 'entries from before chaining were added, removed or changed since they were adopted', checked)
-    } else {
-      const inRange = entries.filter((e) => e.at <= s.upTo && (!s.fromAt || e.at > s.fromAt)).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : String(a.id) < String(b.id) ? -1 : 1))
-      if (inRange.length !== s.count || sealDigest(s.prevDigest ?? null, inRange.map((e) => e.hash), s.upTo) !== s.digest) return fail(s.id, 'entries in a sealed range were added, removed, reordered or changed', checked)
+  const count = async (at: string, where: Record<string, unknown>) => {
+    try {
+      return (await payload.count({ collection: o.slug as never, where: where as never, overrideAccess: true })).totalDocs
+    } catch (error) {
+      throw new Stop(at, `the trail couldn't be counted here (${(error as Error | undefined)?.name ?? typeof error})`, false)
     }
-    prevSeal = s
   }
-  const sealHead = (await allSorted(payload, o.heads, { key: { equals: SEAL_KEY } }))[0] as { hash: string } | undefined
-  if (prevSeal && sealHead?.hash !== prevSeal.digest) return fail(prevSeal.id, 'the newest seal is missing or changed', checked)
-  // 4. Warnings, not breaks: entries waiting longer than an interval for a seal.
-  const sealedTo = prevSeal?.upTo ?? null
-  const overdue = new Date(now.getTime() - (o.sealEveryHours * 60 + o.sealGraceMinutes) * 60_000).toISOString()
-  const waiting = entries.filter((e) => e.at < overdue && (!sealedTo || e.at > sealedTo)).length
-  if (waiting) warnings.push(`${waiting} entr${waiting === 1 ? 'y has' : 'ies have'} waited more than ${o.sealEveryHours} hours for a seal; run sealAuditTrail.`)
-  return { ok: true, checked, warnings }
+
+  /**
+   * A collection in the order of one or two fields, a page at a time. Each page starts at the last row of the page
+   * before and must meet it again, so a row sharing its position can't fall between two pages.
+   */
+  async function* ordered(slug: string, base: Record<string, unknown>[], fields: [string] | [string, string]): AsyncGenerator<Record<string, any>> {
+    const [a, b] = fields
+    let last: Record<string, any> | null = null
+    for (;;) {
+      const at: string = last ? `${slug} after ${fields.map((f) => String(last![f])).join(' #')}` : `the start of ${slug}`
+      const cursor = !last ? [] : b ? [{ or: [{ [a]: { greater_than: last[a] } }, { and: [{ [a]: { equals: last[a] } }, { [b]: { greater_than_equal: last[b] } }] }] }] : [{ [a]: { greater_than_equal: last[a] } }]
+      const limit = size + (last ? 1 : 0)
+      const docs = await find(at, slug, allOf([...base, ...cursor]), fields, limit)
+      let met = !last
+      let fresh: Record<string, any> | null = null
+      for (const d of docs) {
+        if (last && String(d.id) === String(last.id)) {
+          met = true
+          continue
+        }
+        const before: Record<string, any> | null = fresh ?? last
+        fresh = d
+        yield d
+        // The caller treats two rows in one position as a break. If it didn't, paging can't go on safely.
+        if (before && d[a] === before[a] && (!b || d[b] === before[b])) throw new Stop(`${slug} at ${fields.map((f) => String(d[f])).join(' #')}`, `two rows share this position; ${OUT_OF_ORDER}`, false)
+      }
+      if (!met) throw new Stop(at, OUT_OF_ORDER, false)
+      if (docs.length < limit || !fresh) return
+      last = fresh
+    }
+  }
+
+  /**
+   * Entries in time order, then by id, a page at a time. The database sorts by time alone (its index does that
+   * without reading ahead); entries sharing a page's last moment are read again by id, however many there are.
+   */
+  async function* byTime(base: Record<string, unknown>[]): AsyncGenerator<Record<string, any>> {
+    let after: string | null = null
+    for (;;) {
+      const at: string = after ? `${o.slug} after ${after}` : `the start of ${o.slug}`
+      const docs = await find(at, o.slug, allOf([...base, ...(after ? [{ at: { greater_than: after } }] : [])]), ['at'], size)
+      for (const d of docs) if (typeof d.at !== 'string' || (after !== null && d.at <= after)) throw new Stop(at, OUT_OF_ORDER, false)
+      if (docs.length < size) {
+        yield* docs.sort(byAtThenId)
+        return
+      }
+      const edge: string = docs.reduce((latest, d) => (d.at > latest ? d.at : latest), docs[0]!.at as string)
+      yield* docs.filter((d) => d.at < edge).sort(byAtThenId)
+      let lastId: unknown = null
+      for (;;) {
+        const group = await find(`${o.slug} at ${edge}`, o.slug, allOf([...base, { at: { equals: edge } }, ...(lastId === null ? [] : [{ id: { greater_than: lastId } }])]), ['id'], size)
+        for (const d of group) if (d.at !== edge || String(d.id) === String(lastId)) throw new Stop(`${o.slug} at ${edge}`, OUT_OF_ORDER, false)
+        yield* group
+        if (group.length < size) break
+        lastId = group.at(-1)!.id
+      }
+      after = edge
+    }
+  }
+
+  const progress = async (phase: VerifyProgress['phase']) => {
+    if (args.onProgress) await args.onProgress({ phase, read, checked, seals: sealsRead })
+  }
+  /** Counts an entry as read. False when `stopAfter` was already reached, so this one is left unread. */
+  const take = async () => {
+    if (args.stopAfter !== undefined && read >= args.stopAfter) return !(stopped = true)
+    read++
+    if (read % size === 0) await progress('entries')
+    return true
+  }
+
+  try {
+    // Where to start: the beginning, or a seal the caller verified before.
+    let after: string | null = null
+    let anchor: Seal | null = null
+    let walkFrom: number | null = null
+    if (args.from !== undefined) {
+      const digest = String(args.from)
+      const found = (await find('the seal to start from', o.seals, { digest: { equals: digest } }, ['seq'], 2)) as unknown as Seal[]
+      if (found.length !== 1) throw new Stop(digest, found.length ? 'two seals carry the digest to start from' : 'the seal to start from was not found: it was changed or removed, or the digest isn’t one of this trail’s seals', false)
+      anchor = found[0]!
+      if (anchor.kind !== 'seal' && anchor.kind !== 'checkpoint') throw new Stop(digest, 'verify can start from a seal or a checkpoint, not from an adoption seal', false)
+      after = new Date(anchor.upTo).toISOString()
+      walkFrom = anchor.seq
+      if (anchor.kind === 'checkpoint') {
+        // Seals written before the checkpoint can end after its cut. Their entries are in range, so they're recomputed too.
+        const earlier = (await find('the seals', o.seals, { and: [{ kind: { equals: 'seal' } }, { upTo: { greater_than: after } }] }, ['seq'], 1))[0]
+        if (earlier && earlier.seq < walkFrom) walkFrom = earlier.seq
+      }
+      range.from = { kind: anchor.kind, seq: anchor.seq, digest: anchor.digest, upTo: after }
+      range.skipped = await count('the entries before the seal to start from', { at: { less_than_equal: after } })
+    }
+    const inRange = after ? [{ at: { greater_than: after } }] : []
+    const checkpoint = ((await find('the seals', o.seals, { kind: { equals: 'checkpoint' } }, ['-seq'], 1))[0] as Seal | undefined) ?? null
+    // Entries with no hash were written before chaining. They're allowed only inside the adoption seal's range.
+    const adoption = ((await find('the seals', o.seals, { kind: { equals: 'adoption' } }, ['seq'], 1))[0] as Seal | undefined) ?? null
+    const adoptionRead = Boolean(adoption) && (walkFrom === null || adoption!.seq >= walkFrom)
+
+    for await (const e of byTime([unhashedWhere, ...inRange])) {
+      if (!(await take())) break
+      if (e.values && (!e.valuesHash || valuesHashOf(e.values) !== e.valuesHash)) throw new Stop(String(e.id), 'its logged values were changed')
+      if (!adoption) throw new Stop(String(e.id), 'an entry has no hash and there is no adoption seal (it was written outside the plugin, or adoptExistingEntries hasn’t run)')
+      if (new Date(e.at).toISOString() > adoption.upTo) throw new Stop(String(e.id), 'an entry has no hash and was written after the adoption seal (something wrote around the plugin)')
+      if (!adoptionRead) throw new Stop(String(e.id), 'an entry with no hash is dated after the seal this check started from, and its adoption seal is before it: run a full verify')
+    }
+
+    const since = args.since?.toISOString()
+    // 1. Each record's chain: hashes, links, no gaps. Only the entry before is kept, and the chains finished since the last look at the heads.
+    type Ended = { key: string; id: string | number; hash: string; seq: number }
+    let ended: Ended[] = []
+    let headsRead: string | null = null
+    let headBreak: { id: string; reason: string } | null = null
+    let noHead: string | null = null
+    // 2. Heads: each chain's newest entry must be the one its head points to (an entry deleted after its last seal
+    // shows here). Chains and heads come in the same order, so the heads up to the last finished chain are read
+    // beside them; the database does every comparison of keys. A break here waits: one in an entry comes first.
+    const checkHeads = async (final: boolean) => {
+      if (!final && !ended.length) return
+      const place = new Map(ended.map((c, i) => [c.key, i]))
+      const upper = final ? null : ended.at(-1)!.key
+      const missed: Ended[] = []
+      let next = 0
+      const base = [{ key: { not_equals: SEAL_KEY } }, ...inRange, ...(headsRead === null ? [] : [{ key: { greater_than: headsRead } }]), ...(upper === null ? [] : [{ key: { less_than_equal: upper } }])]
+      for await (const h of ordered(o.heads, base, ['key'])) {
+        const i = place.get(h.key)
+        if (i === undefined) {
+          if (checkpoint && h.at && h.at < checkpoint.upTo) continue // the whole chain was pruned
+          headBreak ??= { id: String(h.key), reason: after ? 'every entry of this chain written after the seal is missing' : 'every entry of this chain is missing' }
+          continue
+        }
+        // A head that comes before one already matched leaves the chains between them in `missed`, and stops below.
+        for (; next < i; next++) missed.push(ended[next]!)
+        const last = ended[i]!
+        next = i + 1
+        if (last.hash !== h.hash || last.seq !== h.seq) headBreak ??= { id: String(last.id), reason: `the newest entries of ${h.key} are missing or changed` }
+      }
+      for (; next < ended.length; next++) missed.push(ended[next]!)
+      if (missed.length) {
+        // No head where the chain's place is. If it has one elsewhere, the chains didn't come in order: stop.
+        const elsewhere = await find(`the head of ${missed[0]!.key}`, o.heads, { key: { in: missed.map((c) => c.key) } }, ['key'], missed.length)
+        if (elsewhere.length) throw new Stop(String(elsewhere[0]!.key), after ? `the head of this chain is out of place, or dated before the seal while its entries are after it; ${OUT_OF_ORDER}` : OUT_OF_ORDER, false)
+        noHead ??= missed[0]!.key
+      }
+      if (upper !== null) headsRead = upper
+      ended = []
+    }
+    let prev: Entry | undefined
+    if (!stopped)
+      for await (const row of ordered(o.slug, [...hashedWhere, ...inRange], ['chainKey', 'seq'])) {
+        const e = row as Entry
+        if (!(await take())) break
+        if (prev && e.chainKey !== prev.chainKey) {
+          ended.push({ key: prev.chainKey, id: prev.id, hash: prev.hash, seq: prev.seq })
+          prev = undefined
+          if (ended.length >= size) await checkHeads(false)
+        }
+        if (!since || e.at >= since) {
+          checked++
+          const extra = Object.fromEntries(o.extraNames.filter((k) => e[k] !== undefined).map((k) => [k, e[k]]))
+          if (entryHash({ ...(e as unknown as Parameters<typeof entryHash>[0]), extra }) !== e.hash) throw new Stop(String(e.id), 'the entry was changed after it was written')
+          if (e.values && e.valuesHash && valuesHashOf(e.values) !== e.valuesHash) throw new Stop(String(e.id), 'its logged values were changed')
+        }
+        if (typeof e.chainKey !== 'string' || typeof e.seq !== 'number') throw new Stop(String(e.id), 'the entry has no place in a chain (it was changed after it was written)')
+        if (prev) {
+          if (e.seq !== prev.seq + 1) throw new Stop(String(e.id), `an entry before it in ${e.chainKey} is missing`)
+          if (e.prevHash !== prev.hash) throw new Stop(String(e.id), `it doesn't link to the entry before it in ${e.chainKey}`)
+        } else if (e.seq !== 1 && !(e.prevAt && ((checkpoint && new Date(e.prevAt).toISOString() <= checkpoint.upTo) || (after && new Date(e.prevAt).toISOString() <= after)))) {
+          // A chain may start mid-way only where a checkpoint recorded the cut, or at the seal this check started
+          // from, and only if what's before it is from before that point.
+          throw new Stop(String(e.id), `the start of ${e.chainKey} is missing`)
+        } else if (e.seq === 1 && e.prevHash) throw new Stop(String(e.id), 'a first entry links to something')
+        prev = e
+      }
+    if (!stopped) {
+      if (prev) ended.push({ key: prev.chainKey, id: prev.id, hash: prev.hash, seq: prev.seq })
+      await checkHeads(true)
+    }
+    await progress('entries')
+    const pending = (headBreak as { id: string; reason: string } | null) ?? (noHead === null ? null : { id: String(noHead), reason: 'this chain has no head (it was added outside the plugin)' })
+    if (pending) throw new Stop(pending.id, pending.reason, !stopped)
+    if (stopped) return result(false, false)
+
+    // 3. Seals: each digest from the entries in its range, each linked to the one before. A digest is built as its
+    // entries are read, never from a list of them.
+    let prevSeal: Seal | null = null
+    for await (const row of ordered(o.seals, walkFrom === null ? [] : [{ seq: { greater_than_equal: walkFrom } }], ['seq'])) {
+      const s = row as unknown as Seal
+      sealsRead++
+      if (prevSeal && s.prevDigest !== prevSeal.digest) throw new Stop(String(s.id), 'a seal doesn’t link to the seal before it')
+      if (s.kind === 'checkpoint') {
+        if (sealDigest(s.prevDigest ?? null, [], s.upTo, 'checkpoint') !== s.digest) throw new Stop(String(s.id), 'a checkpoint was changed')
+      } else if (s.kind === 'adoption') {
+        // Once a checkpoint cut past the whole adoption, its entries are gone by design and only the link is checked.
+        const prunedPast = checkpoint && checkpoint.upTo >= new Date(s.upTo).toISOString()
+        if (prunedPast) {
+          const left = (await byTime([unhashedWhere]).next()).value as Record<string, any> | undefined
+          if (left) throw new Stop(String(left.id), 'an adopted entry is still here after the cut that should have removed it')
+        } else {
+          const running = sealHasher(s.prevDigest ?? null, new Date(s.upTo).toISOString(), 'adoption')
+          let inSeal = 0
+          for await (const e of byTime([unhashedWhere])) {
+            running.add(adoptedHash(e))
+            if (++inSeal > s.count) break
+          }
+          if (inSeal !== s.count || running.digest() !== s.digest) throw new Stop(String(s.id), 'entries from before chaining were added, removed or changed since they were adopted')
+        }
+      } else {
+        const running = sealHasher(s.prevDigest ?? null, s.upTo)
+        let inSeal = 0
+        for await (const e of byTime([...hashedWhere, { at: { less_than_equal: s.upTo } }, ...(s.fromAt ? [{ at: { greater_than: s.fromAt } }] : [])])) {
+          running.add(String(e.hash))
+          if (++inSeal > s.count) break
+        }
+        if (inSeal !== s.count || running.digest() !== s.digest) throw new Stop(String(s.id), 'entries in a sealed range were added, removed, reordered or changed')
+      }
+      prevSeal = s
+      await progress('seals')
+    }
+    const sealHead = (await find('the newest seal', o.heads, { key: { equals: SEAL_KEY } }, ['key'], 1))[0] as { hash: string } | undefined
+    if (prevSeal && sealHead?.hash !== prevSeal.digest) throw new Stop(String(prevSeal.id), 'the newest seal is missing or changed')
+    // 4. Warnings, not breaks: entries waiting longer than an interval for a seal.
+    const sealedTo = prevSeal?.upTo ?? null
+    const overdue = new Date(now.getTime() - (o.sealEveryHours * 60 + o.sealGraceMinutes) * 60_000).toISOString()
+    const waiting = await count('the entries waiting for a seal', { and: [...hashedWhere, { at: { less_than: overdue } }, ...(sealedTo ? [{ at: { greater_than: sealedTo } }] : [])] })
+    if (waiting) warnings.push(`${waiting} entr${waiting === 1 ? 'y has' : 'ies have'} waited more than ${o.sealEveryHours} hours for a seal; run sealAuditTrail.`)
+    return result(true, true)
+  } catch (error) {
+    if (error instanceof Stop) return result(false, error.finished, { id: error.id, reason: error.reason })
+    throw error
+  }
 }
 
 const valuesHashOf = (values: unknown) => valuesHash(values)
@@ -664,6 +929,8 @@ function trailCollection(o: Resolved, opts: AuditTrailOptions): CollectionConfig
       { name: 'valuesHash', type: 'text', admin: { hidden: true } },
       ...(opts.extraFields ?? []),
     ],
+    // Verify reads each record's chain in order, a page at a time.
+    indexes: [{ fields: ['chainKey', 'seq'] }],
     timestamps: false,
   }
 }

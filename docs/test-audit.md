@@ -204,3 +204,69 @@ Now 77 tests on main.
 The two reset guards that survived the last mutation check were redundant with a third; one was removed (the sign-in clear), and the other two now each have a test that fails without them.
 
 After the third read (approved f8cdfb4), 79 tests: "two nested writes to one record each use their own reading…" (fails if the oldest reading is taken instead of the newest, the mutation that survived before) and "forgets a failed reset's reading…" (failed first). The sign-in clear removed in f8cdfb4 is back, now with a test that isolates it. Known and stated in the README: an outer entry may also list a hidden field or password a nested inner write changed.
+
+## 2026-11-11: verify a page at a time (K33)
+
+Baseline 79 tests, now 101: 22 in `test/verify-stream.test.ts`, on the same in-memory MongoDB replica set. `test/legacy-verify.ts` is the old verify, word for word; "agrees" below means the streaming verify's `ok`, `checked`, `firstBreak` and `warnings` equal its answer at page sizes 1, 2, 3 and 1,000.
+
+| Promise | Test |
+| --- | --- |
+| The same answer as before: empty trail, intact (sealed and not) | "an empty trail, and an intact one…" |
+| The same for an entry changed (sealed, newest, a site field, logged values) | "an entry changed…" |
+| The same for an entry deleted (newest, middle, first), a chain deleted with and without its head | "an entry deleted…" |
+| The same for a missing head, and for several head breaks at once (the old order of reporting) | "a head deleted while its chain stays…" |
+| The same for reordered entries (in a chain, in time), a relinked one, a forged one in a sealed range | "entries reordered…" |
+| The same for a broken seal (digest, count, newest deleted, middle deleted, seal head) | "a broken seal…" |
+| The same for a broken checkpoint and after a prune | "a broken checkpoint…" |
+| The same for entries from before chaining (unadopted, adopted, changed, added, written after) | "entries from before chaining…" |
+| The same with `since` and for the overdue warning | "`since`, and the warning…" |
+| A seal's digest built one hash at a time equals `sealDigest` | "builds a seal's digest one hash at a time…" |
+| Never the whole trail: on 3,130 made-up entries over 700 records, read 50 at a time, every query has a limit of at most a page plus one, nothing longer comes back, and the default page is 1,000 | "never asks for more than a page…" |
+| Tampering caught in the first, a middle and the last page; a deletion and a copied entry where two pages meet; the last head; an entry among 130 sharing one moment | "catches tampering in the first page…" |
+| `from` a seal reads only what came after (the 2,000 entries before the seal's own range are never read) and says so | "starts from a seal and reads only what came after it" |
+| `from`: range and summary; a change before the seal isn't claimed; after it, a changed entry, a deleted newest entry, a sealed chain deleted, a missing predecessor are caught; the seal moved later is a break; an unknown digest fails | "says what it checked, and misses nothing…" |
+| `from` a checkpoint recomputes the seals that end after its cut; an adoption seal is refused | "starts from a checkpoint too…" |
+| `from`: an unhashed entry dated after the seal, with the adoption before it, is never passed | "won't pass an unhashed entry…" |
+| `stopAfter` reports not finished, never ok; finishes when nothing is left; still reports a break it read; bad `pageSize` and `stopAfter` throw | "reports not finished, never ok…" |
+| `onProgress` after each page and seal; a callback that throws is never a pass | "calls back as it goes…" |
+| A failed read in any part (entries, heads, seals, the seal head, the count) is a failed result with the place and the error's name, never its message | "a read that fails, in any part…" |
+| A read over its limit, a page that doesn't start where the last ended, a seal's entries out of time order, a skipped page | "a read that returns more than a page, or pages out of order…" |
+| Two seals in one position stop the paging, at any page size | "two seals in one position…" |
+| Whole chains coming round again are a failed verification | "chains that come round again…" |
+
+**Mutation check**, in a copy of the repo (never the live tree; each file backed up, changed by a Python string replace, and restored byte for byte). All 27 made a test fail:
+
+| Guard broken | Caught by |
+| --- | --- |
+| A read longer than its limit | "a read that returns more than a page…" |
+| A failed read (turned into an empty page) | "a read that fails, in any part…" |
+| A page must start at the row the last one ended on | "a read that returns more than a page…" |
+| Two rows in one position | "two seals in one position…" |
+| Time order across a seal's pages | "a read that returns more than a page…" |
+| A chain whose head is elsewhere (read out of order) | "chains that come round again…" |
+| A stopped run reporting ok; `stopAfter` ignored | "reports not finished, never ok…" |
+| `from`: entries limited to after the seal; heads limited likewise | "starts from a seal…", "says what it checked…" |
+| `from`: seals before a checkpoint recomputed; an adoption seal refused | "starts from a checkpoint too…" |
+| `from`: a chain may start only where its predecessor is before the seal; an unknown digest; the seal itself recomputed | "says what it checked…" |
+| `from`: the `partial` flag | the three `from` tests |
+| `from`: an unhashed entry after the seal | "won't pass an unhashed entry…" |
+| The running digest's separator; a seal's lower bound; a seal's count | the equivalence tests |
+| The cursor re-reading its last row (an entry sharing a position across pages) | the equivalence tests at page size 1 |
+| A shared moment longer than a page | "never asks for more than a page…" |
+| A count that fails; the error's name, not its message | "a read that fails, in any part…" |
+| A head break held until the entries are read | "an entry deleted…" |
+| `onProgress`; `pageSize` | "calls back as it goes…", "never asks for more than a page…" |
+
+Two guards survived the first pass and were removed as redundant, each already covered by a stronger one: a head arriving behind one already matched (the chains between them are then found "elsewhere", which stops), and re-reading the seal a `from` run started at (the walk starts at its sequence number, so it's always read).
+
+**Gaps skipped, and why:**
+
+- Memory measured in bytes: the tests count what each query asks for and returns instead, which is what bounds it. Heap size under Vitest is too noisy to assert on.
+- A site with a database collation: every key comparison is done by the database, so chains and heads can't disagree, but no test runs with a collation set.
+- A verify racing live writes: it can report a break that a second run doesn't (the README says so). The old verify had the same window.
+- Trails of millions of entries: a scale and timing test belongs to the site.
+
+**For the lead (found here, not fixed):**
+
+1. **A second prune can leave verify reporting a break that isn't one.** With a checkpoint from an earlier prune still in the seal chain, a later prune that deletes the seal written right after it leaves the next seal linking to a seal that's gone, and verify says "a seal doesn't link to the seal before it". The old verify does the same (it's the seal walk both share, kept identical here on purpose). Seen in a throwaway probe: seal, seal, prune at the first, two more seals, prune at the third. A site that prunes on a schedule will hit it. The fix belongs in prune or in the link rule, with its own security read.
+2. `sealAuditTrail` still reads one interval's entries at once, and `adoptExistingEntries` the whole old log in one transaction.
