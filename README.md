@@ -20,6 +20,19 @@ A tamper-evident audit trail for Payload: who changed which fields of which reco
 - **A sink for other plugins.** `recordEvent(payload, { action, subject, req, … })` writes one entry with the same rules. `fromPluginEvent(mapper)` adapts another plugin's `onEvent` in one line. It throws if the event can't be recorded, unless you choose `{ onError: 'log' }`.
 - **Retention you run.** `pruneAuditTrail(payload, { valuesOlderThanDays, olderThanDays })` from your job; nothing is deleted without arguments. Entries are cut only at the end of a seal no later than the age you ask for, and a checkpoint seal records the cut first. With no such seal yet, nothing is deleted.
 
+## On its own, and with others
+
+**On its own:** it needs MongoDB with transactions (or `onWriteError: 'log'`), the collections you list, and a users collection for actors. With no other plugin, `via` stays empty and entries come from collection changes and your own `recordEvent` calls.
+
+**Works with:**
+- **Hats, Masq and Guardians:** your `via` resolver can use `hatsStateOf(req)`, `masqueraderOf(req)` and `viaGuardian(req)`, so an entry says how a change was made.
+- **Age Gate, MFA, Hats and Guardians:** pass their `onEvent` through `fromPluginEvent`, and name their events in `actions`.
+- **Masq:** its `onStart` and `onStop` can call `recordEvent` with a `masquerade` action.
+
+The plugin imports none of them. The site connects them in its own config.
+
+**Family:** It's part of the **Compliance** family (a working draft): plugins designed to sit together for records you can stand behind. The other member, Encrypted Fields, isn't built yet.
+
 ## Install
 
 ```bash
