@@ -4,24 +4,24 @@ import { BasePayload, buildConfig, type CollectionConfig, type Payload } from 'p
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { canonical, entryHash } from '../src/chain.js'
-import { auditTrail, pruneAuditTrail, sealAuditTrail, verifyAuditTrail } from '../src/index.js'
+import { auditTrail, pruneAuditTrail, recordEvent, sealAuditTrail, verifyAuditTrail, type AuditTrailOptions } from '../src/index.js'
 
 /** Each test gets its own made-up site and database, since verify reads the whole trail. */
 const SECRET = 'a-made-up-app-secret-for-tests-only-0123456789'
 let mongo: MongoMemoryReplSet
 let n = 0
-const sealed: string[] = []
+const sealed: { digest: string; kind: string; upTo: string }[] = []
 const notes: CollectionConfig = { slug: 'notes', access: { read: () => true, create: () => true, update: () => true, delete: () => true }, fields: [{ name: 'text', type: 'text' }, { name: 'count', type: 'number' }] }
 const users: CollectionConfig = { slug: 'users', auth: true, fields: [] }
 
-async function site(grace = 0, extraFields = [{ name: 'tenant', type: 'text' as const }]) {
+async function site(grace = 0, extraFields: { name: string; type: 'text'; required?: boolean }[] = [{ name: 'tenant', type: 'text' as const }], more: Partial<AuditTrailOptions> = {}) {
   const config = await buildConfig({
     secret: SECRET,
     telemetry: false,
     typescript: { autoGenerate: false },
     db: mongooseAdapter({ url: mongo.getUri(`chain${++n}`), ensureIndexes: true }),
     collections: [users, notes],
-    plugins: [auditTrail({ collections: ['notes'], values: { notes: ['count'] }, sealGraceMinutes: grace, extraFields, extra: () => ({ tenant: 't1' }), onSeal: (s) => void sealed.push(s.digest) })],
+    plugins: [auditTrail({ collections: ['notes'], values: { notes: ['count'] }, sealGraceMinutes: grace, extraFields, extra: () => ({ tenant: 't1' }), onSeal: (s) => void sealed.push(s), ...more })],
   })
   return new BasePayload().init({ config })
 }
@@ -194,5 +194,184 @@ describe('the hash itself', () => {
     expect(entryHash({ ...base, via: null })).toBe(entryHash({ ...base, via: { kind: null, ref: null, label: null } }))
     expect(entryHash({ ...base, changedFields: ['b', 'a'] })).toBe(entryHash({ ...base, changedFields: ['a', 'b'] }))
     expect(entryHash({ ...base, extra: { tenant: 't1' } })).not.toBe(entryHash(base))
+  })
+})
+
+// Added by the full self-audit (K30, 2026-11-10): each break verify claims to report, and the guards around it.
+/** Rewrites an entry with a new hash that matches its new content, as someone who knows the hash rule would. */
+const rehash = (e: Record<string, any>, change: Record<string, unknown>) => {
+  const next = { ...e, ...change }
+  return { ...change, hash: entryHash({ ...next, extra: next.tenant ? { tenant: next.tenant } : {} } as never) }
+}
+const seals = async (p: Payload) => (await p.find({ collection: 'audit-events-seals' as never, sort: 'seq', limit: 0, pagination: false, overrideAccess: true })).docs as unknown as Record<string, any>[]
+
+describe('catching tampering, every kind verify names', () => {
+  it('an entry relinked to a made-up previous hash, with its own hash recomputed', async () => {
+    const p = await site()
+    const a = await make(p)
+    await edit(p, a.id, { text: 'second' })
+    const second = (await trail(p))[1]!
+    await raw(p, 'audit-events').updateOne({ seq: 2 }, { $set: rehash(second, { prevHash: 'f'.repeat(64) }) })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/doesn't link to the entry before it/)
+    await p.destroy()
+  })
+
+  it('a first entry made to link to something, with its own hash recomputed', async () => {
+    const p = await site()
+    await make(p)
+    const first = (await trail(p))[0]!
+    await raw(p, 'audit-events').updateOne({ seq: 1 }, { $set: rehash(first, { prevHash: 'f'.repeat(64) }) })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/first entry links to something/)
+    await p.destroy()
+  })
+
+  it('a site field (extraFields) or the stored hash edited', async () => {
+    const p = await site()
+    await make(p)
+    await raw(p, 'audit-events').updateOne({ seq: 1 }, { $set: { tenant: 't2' } })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/changed after it was written/)
+    await raw(p, 'audit-events').updateOne({ seq: 1 }, { $set: { tenant: 't1', hash: '0'.repeat(64) } })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/changed after it was written/)
+    await p.destroy()
+  })
+
+  it('a record’s whole chain deleted before a seal while its head stays, or its head deleted while the chain stays', async () => {
+    const p = await site()
+    const a = await make(p)
+    await raw(p, 'audit-events').deleteMany({ chainKey: `notes:${a.id}` })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/every entry of this chain is missing/)
+    const p2 = await site()
+    const b = await make(p2)
+    await raw(p2, 'audit-events-heads').deleteOne({ key: `notes:${b.id}` })
+    expect((await verifyAuditTrail(p2)).firstBreak?.reason).toMatch(/has no head/)
+    await p.destroy()
+    await p2.destroy()
+  })
+
+  it('a well-formed entry, with its own chain and head, slipped into a sealed range', async () => {
+    const p = await site()
+    await make(p)
+    await sealNow(p)
+    const at = (await trail(p))[0]!.at
+    const forged = { at, action: 'create', subjectCollection: 'notes', subjectId: 'forged', origin: 'manual', changedFields: ['text'], chainKey: 'notes:forged', seq: 1, prevHash: null, tenant: 't1' }
+    const hash = entryHash({ ...forged, extra: { tenant: 't1' } })
+    await raw(p, 'audit-events').insertOne({ ...forged, at: new Date(at), hash })
+    await raw(p, 'audit-events-heads').insertOne({ key: 'notes:forged', hash, seq: 1, at: new Date(at) })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/sealed range were added, removed, reordered or changed/)
+    await p.destroy()
+  })
+
+  it('a seal’s digest edited, the newest seal deleted, or a seal in the middle deleted', async () => {
+    const p = await site()
+    await make(p)
+    await sealNow(p)
+    await make(p)
+    await sealNow(p)
+    await make(p)
+    await sealNow(p)
+    expect((await verifyAuditTrail(p)).ok).toBe(true)
+    const [s1, s2, s3] = await seals(p)
+    // onSeal got each digest as stored, so a copy kept outside can be compared.
+    expect(sealed.slice(-3).map((s) => s.digest)).toEqual([s1!.digest, s2!.digest, s3!.digest])
+    await raw(p, 'audit-events-seals').updateOne({ seq: 1 }, { $set: { digest: '0'.repeat(64) } })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/sealed range/)
+    await raw(p, 'audit-events-seals').updateOne({ seq: 1 }, { $set: { digest: s1!.digest } })
+    await raw(p, 'audit-events-seals').deleteOne({ seq: 3 })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/newest seal is missing or changed/)
+    await raw(p, 'audit-events-seals').insertOne({ ...s3, _id: undefined, id: undefined, upTo: new Date(s3!.upTo), fromAt: s3!.fromAt ? new Date(s3!.fromAt) : null })
+    await raw(p, 'audit-events-seals').deleteOne({ seq: 2 })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/link to the seal before it/)
+    await p.destroy()
+  })
+
+  it('a checkpoint moved later, to excuse deleting more', async () => {
+    const p = await site()
+    await make(p)
+    await sealNow(p)
+    const future = new Date(Date.now() + 86_400_000)
+    await pruneAuditTrail(p, { olderThanDays: 0, now: future })
+    expect(sealed.at(-1)?.kind).toBe('checkpoint')
+    expect((await verifyAuditTrail(p)).ok).toBe(true)
+    await raw(p, 'audit-events-seals').updateOne({ kind: 'checkpoint' }, { $set: { upTo: future } })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toMatch(/checkpoint was changed/)
+    await p.destroy()
+  })
+
+  it('with `since`, links and heads are still checked for older entries', async () => {
+    const p = await site()
+    const a = await make(p)
+    await edit(p, a.id, { text: 'second' })
+    await edit(p, a.id, { text: 'third' })
+    await raw(p, 'audit-events').deleteOne({ seq: 2 })
+    const r = await verifyAuditTrail(p, { since: new Date(Date.now() + 60_000) })
+    expect(r.checked).toBe(0)
+    expect(r.firstBreak?.reason).toMatch(/missing/)
+    await p.destroy()
+  })
+})
+
+describe('pruning never takes more than it says', () => {
+  it('deletes nothing with no seal yet, however old the entries', async () => {
+    const p = await site()
+    await make(p)
+    expect(await pruneAuditTrail(p, { olderThanDays: 0, now: new Date(Date.now() + 30 * 86_400_000) })).toEqual({ valuesCleared: 0, deleted: 0 })
+    expect(await trail(p)).toHaveLength(1)
+    expect(await seals(p)).toHaveLength(0)
+    await p.destroy()
+  })
+
+  it('keeps entries after the last seal’s end even when they’re older than asked, and they verify', async () => {
+    const p = await site()
+    const a = await make(p, 'sealed')
+    await sealNow(p)
+    await edit(p, a.id, { text: 'after the seal' })
+    await make(p, 'also after')
+    const r = await pruneAuditTrail(p, { olderThanDays: 0, now: new Date(Date.now() + 86_400_000) })
+    expect(r.deleted).toBe(1)
+    expect((await trail(p)).map((e) => e.seq).sort()).toEqual([1, 2])
+    expect((await verifyAuditTrail(p)).ok).toBe(true)
+    await p.destroy()
+  })
+})
+
+describe('who can see or change the trail', () => {
+  it('nobody reads it by default; the trail, heads and seals refuse every write, even from someone who may read', async () => {
+    const closed = await site()
+    await make(closed)
+    await expect(closed.find({ collection: 'audit-events' as never, overrideAccess: false })).rejects.toThrow()
+    await closed.destroy()
+
+    const p = await site(0, undefined, { access: { read: () => true } })
+    const a = await make(p)
+    await edit(p, a.id, { count: 2 })
+    const seen = (await p.find({ collection: 'audit-events' as never, sort: 'seq', overrideAccess: false })).docs as unknown as Record<string, any>[]
+    expect(seen).toHaveLength(2)
+    // Reading the trail isn't reading values: `access.values` defaults to nobody.
+    expect(seen[1]!.changedFields).toEqual(['count'])
+    expect(seen[1]!.values ?? null).toBeNull()
+    const id = String(seen[0]!.id)
+    await expect(p.create({ collection: 'audit-events' as never, data: { at: new Date().toISOString(), action: 'create', subjectCollection: 'notes', subjectId: 'x', origin: 'manual' } as never, overrideAccess: false })).rejects.toThrow()
+    await expect(p.update({ collection: 'audit-events' as never, id, data: { reason: 'edited' } as never, overrideAccess: false })).rejects.toThrow()
+    await expect(p.delete({ collection: 'audit-events' as never, id, overrideAccess: false })).rejects.toThrow()
+    await sealNow(p)
+    for (const slug of ['audit-events-heads', 'audit-events-seals']) {
+      await expect(p.find({ collection: slug as never, overrideAccess: false })).rejects.toThrow()
+      await expect(p.create({ collection: slug as never, data: { key: 'k', hash: 'h', seq: 1, kind: 'seal', digest: 'd', upTo: new Date().toISOString(), count: 0 } as never, overrideAccess: false })).rejects.toThrow()
+    }
+    expect((await verifyAuditTrail(p)).ok).toBe(true)
+    await p.destroy()
+  })
+})
+
+describe('events recorded outside a request', () => {
+  it('open their own transaction: a failed entry leaves the head where it was', async () => {
+    const p = await site(0, [{ name: 'tenant', type: 'text', required: true }])
+    // recordEvent doesn't run the site's `extra`, so without `tenant` the entry fails validation after the head moved.
+    await expect(recordEvent(p, { action: 'update', subject: { collection: 'notes', id: 'n1' }, payload: p })).rejects.toThrow()
+    expect((await p.find({ collection: 'audit-events-heads' as never, overrideAccess: true })).docs).toHaveLength(0)
+    await recordEvent(p, { action: 'update', subject: { collection: 'notes', id: 'n1' }, payload: p, extra: { tenant: 't1' } })
+    expect(await trail(p)).toMatchObject([{ seq: 1, actor: null, origin: 'script' }])
+    expect((await verifyAuditTrail(p)).ok).toBe(true)
+    await p.destroy()
   })
 })

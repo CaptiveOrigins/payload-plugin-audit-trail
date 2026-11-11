@@ -1,5 +1,95 @@
 # Test audit
 
+## 2026-11-10: full self-audit (K30)
+
+Every promise in the README, docs/decisions.md and ADR 0001, against the tests at b7a70e8 plus the ones added here (marked K30). Baseline: 38 tests. Now: 52.
+
+| Promise | Test |
+| --- | --- |
+| Field names only, never values; nothing for a no-op update | audit-trail: "names the fields that changed…" |
+| Create and update recorded | the same, and chain: "links each record's entries…" |
+| Delete recorded, with no fields | audit-trail: "records a delete, with no fields (K30)" |
+| Sign-in internals, timestamps and join fields never listed | "never lists sign-in internals…" |
+| `audit: false` skips; origin, system, reason land | "skips bookkeeping writes…" |
+| `via` from the resolver, empty without | "says how the change was made…" |
+| A failed entry undoes the change (`fail`, with transactions) | "a change whose entry can't be written is undone" |
+| No transactions: refuses to start unless `log` | "won't start without transactions…" |
+| Value log: named fields only, people only in `allowPeople`, capped at 2 KB | "keeps old and new values…" |
+| Startup refusals: hidden, `admin.hidden`, read access, secret, encrypted, personal (by name and as `collection.field`), people links (single and polymorphic), inside an array, sign-in fields (`email`, `password`, `hash`), a missing field | "refuses at startup to log…" and "refuses the rest of its startup cases too (K30)" |
+| Startup refusals: `values` naming a missing collection or one not in `collections`, `collections` naming a missing collection, a slug clash | "refuses the rest of its startup cases too (K30)" |
+| Nobody reads the trail by default | chain: "nobody reads it by default… (K30)" |
+| Reading the trail isn't reading values (`access.values` defaults to nobody) | the same (K30); "shows values only to access.values…" for the admin side |
+| The trail, heads and seals refuse create, update and delete for everyone; heads and seals refuse reads | the same (K30) |
+| Drafts: autosave not recorded, publish and save are, restore recorded with its reason | "records publishing and saving…" |
+| Autosave can't hide a change (no drafts, `draft: false`, other records changed by hooks) | "autosave can't hide a change" (both tests) |
+| Sink: named events, unknown actions refused, mapper errors fail unless `log` | "records named events…" |
+| Events outside a request open their own transaction, so a failed entry leaves the head alone | chain: "events recorded outside a request… (K30)" |
+| No fork under 40 changes at once and 10 on one record | chain: "doesn't fork…" |
+| Two seals at once don't fork | "two seals at once…" |
+| Seals refuse the grace; overdue entries warn | "refuses to reach closer than the grace…" |
+| `onSeal` gets each digest as stored, and the checkpoint too | "a seal's digest edited…" and "a checkpoint moved later…" (K30) |
+| Tampering: an entry edited | "an entry changed in the database" |
+| Tampering: a site field (`extraFields`) or the stored hash edited | "a site field (extraFields) or the stored hash edited" (K30) |
+| Tampering: the newest entry deleted before a seal | "the newest entry deleted…" |
+| Tampering: a middle entry deleted, or a forged one put back | "an entry in the middle deleted…" |
+| Tampering: an entry relinked, hash recomputed | "an entry relinked…" (K30) |
+| Tampering: a first entry made to link to something | "a first entry made to link…" (K30) |
+| Tampering: a whole chain deleted before a seal, head kept; a head deleted, chain kept | "a record's whole chain deleted before a seal…" (K30) |
+| Tampering: a whole chain and its head deleted after a seal | "a whole record's chain deleted, head and all, after a seal" |
+| Tampering: a well-formed entry, with its own chain and head, added in a sealed range | "a well-formed entry… slipped into a sealed range" (K30) |
+| Tampering: a seal's digest edited, the newest seal deleted, a middle seal deleted | "a seal's digest edited…" (K30) |
+| Tampering: a checkpoint moved later | "a checkpoint moved later…" (K30) |
+| Tampering: values edited; clearing them keeps the chain whole | "logged values changed…" |
+| Tampering: the first entry after a prune deleted | "pruning cuts at a seal's end…" |
+| `since` still checks links and heads | "with `since`, links and heads are still checked…" (K30) |
+| Retention: nothing without arguments; values cleared; entries cut only at a seal's end with a checkpoint | "clears old values and deletes…", "pruning cuts at a seal's end…" |
+| Retention: nothing deleted with no seal yet | "deletes nothing with no seal yet…" (K30) |
+| Retention: entries after the last seal's end kept, even when older than asked | "keeps entries after the last seal's end…" (K30) |
+| Hash stable on read back; missing equals null; extra fields added later | "the hash itself" |
+| Adoption (the whole section) | adopt.test.ts, mapped in the K26 section below |
+
+**Gaps added (K30), 14 tests:** the tamper cases verify names but no test reached (a relinked entry, a first entry that links, an edited site field or hash, a chain without entries or without a head, an entry slipped into a sealed range, an edited or missing seal, a moved checkpoint, `since`); append-only access on all three collections and the default read and values access; prune with no seal, and prune keeping entries newer than the cut; a delete; the rest of the startup refusals; an event outside a request rolling back its head.
+
+**Mutation check.** Each guard below was broken by a string replace in `src/index.ts`, the matching test file run, and the file restored. Every one made a test fail:
+
+| Guard broken | Caught by |
+| --- | --- |
+| Verify: an entry's link to the one before | "an entry relinked…" |
+| Verify: a first entry with a link | "a first entry made to link…" |
+| Verify: a chain with no head | "a record's whole chain deleted before a seal…" |
+| Verify: a head with no chain | the same |
+| Verify: each seal's link to the one before | "a seal's digest edited…" |
+| Verify: the seal head | the same |
+| Verify: the checkpoint's digest | "a checkpoint moved later…" |
+| Verify: a seal's digest over its range | "a seal's digest edited…" |
+| Verify: `extraFields` in the hash | "a site field (extraFields) or the stored hash edited" |
+| Prune: no seal, no cut | "deletes nothing with no seal yet…" |
+| Prune: cut at a seal's end, not the age asked | "keeps entries after the last seal's end…" and "a checkpoint moved later…" |
+| Access: the trail's create, update and delete | "nobody reads it by default…" |
+| Access: the trail's default read | the same |
+| Access: heads and seals, read and create | the same |
+| Access: the values field's default read | the same |
+| An event outside a request opening its own transaction | "open their own transaction…" |
+| Startup: encrypted, `admin.hidden`, polymorphic people link, `password` and `hash`, `collection.field` in `personal`, `values` outside `collections`, `collections` naming a missing collection, a slug clash | "refuses the rest of its startup cases too" (each guard broken on its own) |
+
+One mutation survived, as expected: dropping the seal's count check. The digest covers every hash in the range, so the count adds nothing verify needs; dropping the digest instead is caught.
+
+**Gaps skipped, and why:**
+
+- "The trail can't record itself": that check can't be reached. `collections` naming the trail fails the "isn't a collection" check first, and a collection with the trail's slug fails "already exists". Both are tested.
+- A database writer who rewrites entries, heads and seals consistently: verify can't catch that, by design. The README says so; `onSeal` is the defense, and its digest is tested.
+- An unsealed chain deleted after a prune, with its head's `at` backdated: the head's `at` isn't hashed, so this passes verify. It's the README's stated limit (a change is fully protected only once sealed), not a new gap.
+- REST and GraphQL access: they run the same access functions as the Local API with `overrideAccess: false`, which is what the tests use.
+- Relationship and array comparison (`same`): covered indirectly by the no-op update test; testing it alone would be testing a helper.
+- Postgres, a very large trail, and an adoption racing a prune: as in the sections below.
+
+**For the lead (found here, not fixed; `src/` is unchanged):**
+
+1. **`onWriteError: 'log'` with transactions can lose a change silently.** If `payload.create` of the entry fails after the head moved (for example a required `extraFields` field the `extra` resolver left empty), Payload kills the shared transaction. The change is rolled back, but `payload.update` returns as if it worked. The README promises `log` lets the change through.
+2. **`onWriteError: 'log'` without transactions leaves a false break.** The same failure moves the head with no entry behind it, so verify reports "the newest entries… are missing or changed" for good. ADR 0001 says a failed entry under `log` leaves its chain untouched.
+3. **`recordEvent` doesn't run the site's `extra` resolver.** Sink entries get no site fields (such as `tenant`) unless the caller passes `extra`. On a multi-site install whose `access.read` filters by site, those entries are hidden from that site, or shown to every site if the filter lets an empty site through. Worth a decision.
+4. Tests for 1 and 2 once fixed: a no-transaction site with `log` and a required extra field, where verify must still pass; and the same with transactions, where the change must either stick or the call must throw.
+
 ## 2026-11-10 (0.1.0)
 
 Each promise in the README and ADR 0001, and the test that proves it:

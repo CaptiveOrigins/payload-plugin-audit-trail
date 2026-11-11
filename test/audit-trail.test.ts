@@ -96,6 +96,12 @@ describe('what it records', () => {
     expect((await latestFor(e.id)).changedFields).not.toContain('mates')
   })
 
+  it('records a delete, with no fields (K30)', async () => {
+    const e = await newEntry({ notes: 'going' })
+    await payload.delete({ collection: 'studbook-entries', id: e.id, ...(await as(admin)) })
+    expect(await latestFor(e.id)).toMatchObject({ action: 'delete', actor: admin.id, changedFields: [] })
+  })
+
   it('skips bookkeeping writes, and keeps what automated work says about itself', async () => {
     const e = await newEntry()
     const n = (await events({ subjectId: { equals: e.id } })).length
@@ -152,6 +158,35 @@ describe('the value log', () => {
     await expect(with_(['keeper'])).rejects.toThrow(/links to people/)
     await expect(with_(['nope'])).rejects.toThrow(/no such/)
     await expect(cfg({ ...base, values: { users: ['email'] } })).rejects.toThrow(/sign-in/)
+  })
+
+  it('refuses the rest of its startup cases too (K30)', async () => {
+    const kits: CollectionConfig = {
+      slug: 'kits',
+      fields: [
+        { name: 'label', type: 'text' },
+        { name: 'cipher', type: 'text', custom: { encrypted: true } },
+        { name: 'quiet', type: 'text', admin: { hidden: true } },
+        { name: 'either', type: 'relationship', relationTo: ['users', 'plain-notes'] },
+        { name: 'rows', type: 'array', fields: [{ name: 'inner', type: 'text' }] },
+      ],
+    }
+    const build = (opts: Partial<AuditTrailOptions>, collections: CollectionConfig[] = [users, plain, kits]) =>
+      buildConfig({ secret: SECRET, telemetry: false, typescript: { autoGenerate: false }, db: mongooseAdapter({ url: mongo.getUri('refusals') }), collections, plugins: [auditTrail({ collections: ['users', 'kits'], ...opts })] })
+    const kit = (names: string[], extra: Partial<AuditTrailOptions> = {}) => build({ values: { kits: names }, ...extra })
+    await expect(kit(['cipher'])).rejects.toThrow(/secret or encrypted/)
+    await expect(kit(['quiet'])).rejects.toThrow(/hidden/)
+    await expect(kit(['either'])).rejects.toThrow(/links to people/)
+    await expect(kit(['inner'])).rejects.toThrow(/no such top-level field/)
+    await expect(kit(['label'], { personal: ['kits.label'] })).rejects.toThrow(/personal/)
+    await expect(build({ values: { users: ['password'] } })).rejects.toThrow(/sign-in/)
+    await expect(build({ values: { users: ['hash'] } })).rejects.toThrow(/sign-in/)
+    await expect(build({ collections: ['users'], values: { kits: ['label'] } })).rejects.toThrow(/isn't in `collections`/)
+    await expect(build({ values: { ghosts: ['label'] } })).rejects.toThrow(/"ghosts", which isn't a collection/)
+    await expect(build({ collections: ['ghosts'] })).rejects.toThrow(/"ghosts", which isn't a collection/)
+    await expect(build({}, [users, plain, kits, { slug: 'audit-events', fields: [] }])).rejects.toThrow(/already exists/)
+    // And a plain field is fine.
+    await expect(kit(['label'])).resolves.toBeTruthy()
   })
 
   it('shows values only to `access.values`, and the trail only to `access.read`', async () => {
