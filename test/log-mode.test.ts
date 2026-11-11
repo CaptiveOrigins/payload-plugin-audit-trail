@@ -3,7 +3,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { buildConfig, getPayload, type Payload } from 'payload'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
-import { auditTrail, recordEvent, verifyAuditTrail } from '../src/index.js'
+import { auditTrail, fromPluginEvent, recordEvent, verifyAuditTrail } from '../src/index.js'
 
 // `onWriteError: 'log'`, with and without transactions: a failed entry must never lose the change or break the chain.
 type Doc = Record<string, any> // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -88,5 +88,17 @@ describe("onWriteError: 'log'", () => {
     await recordEvent(p, { action: 'exported', subject: { collection: 'notes', id: 'n2' }, extra: { tenant: 't2' }, req: { payload: p, context: { tenant: 't1' } } as never })
     expect((await entries(p)).find((e) => e.subjectId === 'n2')!.tenant).toBe('t2') // the caller's own value wins
     await p.destroy()
+  })
+
+  it('refuses to guess between two running Payloads for an event with no request, and forgets one once it stops', async () => {
+    const one = await make('pick-one', true)
+    const two = await make('pick-two', true)
+    const event = fromPluginEvent((e: { id: string }) => ({ action: 'exported', subject: { collection: 'notes', id: e.id }, extra: { tenant: 't1' } }), { onError: 'fail' })
+    await expect(event({ id: 'n1' })).rejects.toThrow(/several Payloads/)
+    expect((await entries(one)).length + (await entries(two)).length).toBe(0)
+    await two.destroy()
+    await event({ id: 'n2' })
+    expect((await entries(one)).map((e) => e.subjectId)).toEqual(['n2'])
+    await one.destroy()
   })
 })

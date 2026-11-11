@@ -2,12 +2,14 @@
 
 A tamper-evident audit trail for Payload: who changed which fields of which record, from where and through whom, never the values. Each record's entries are hash-chained, a seal chains them across the site, and a verify reports the first break.
 
-**Status:** early, 0.1.0, not on npm yet. 56 tests pass against a real Payload 3.92 with an in-memory MongoDB (a replica set). They cover what's recorded, failing closed with and without transactions, the value log and its startup refusals, read access, drafts, autosave and restores, the sink for other plugins, retention, and the chain: 40 changes at once without a fork, two seals at once, and tampering caught each way (an entry edited, the newest deleted, one removed or forged, a whole record's chain deleted after a seal, values edited, the first entry after a prune deleted), and adopting a log kept before the plugin (verify after it, each kind of tampering with adopted entries, entries written around the plugin, running it twice, and pruning). It isn't in use on any site yet.
+**Status:** early, 0.1.0, not on npm yet. 64 tests pass against a real Payload 3.92 with an in-memory MongoDB (a replica set). They cover what's recorded, failing closed with and without transactions, the value log and its startup refusals, read access, drafts, autosave and restores, the sink for other plugins, retention, and the chain: 40 changes at once without a fork, two seals at once, and tampering caught each way (an entry edited, the newest deleted, one removed or forged, a whole record's chain deleted after a seal, values edited, the first entry after a prune deleted), adopting a log kept before the plugin (verify after it, each kind of tampering with adopted entries, entries written around the plugin, running it twice, and pruning), and passwords recorded by name with the password, hash and salt found nowhere in the trail or the logs. A separate branch tests it with MFA, Hats and Masq installed from npm. It isn't in use on any site yet.
 
 ## What it does
 
 - **Field names, never values.** On create, update and delete in the collections you list, an entry records the record, the action, which top-level fields changed, who did it (`actor`), how (`via`: switched in, a guardian, masquerading), and where from (manual, import, sync, job…).
   - An update that changes nothing records nothing. Sign-in internals, timestamps and join fields are never listed.
+  - **Passwords by name only.** Setting a password (on create, update or a reset by emailed link) lists `password`. Its value, hash and salt never reach an entry, a hash, a log or the request's context: the plugin keeps only the names of the fields a write sent, and whether it set a password.
+  - **Hidden and read-restricted fields** count only when the write set them, or when both copies hold them and they differ. The saved copy leaves them out when they aren't read back, which alone isn't a change.
   - `context: { audit: false }` skips bookkeeping writes. `context: { audit: { origin, system, run, reason } }` describes automated work. `reason` is free text you write: never put values in it.
 - **In the same transaction as the change.** If the entry can't be written, the change fails. That needs transactions, so without a replica set the plugin refuses to start unless you set `onWriteError: 'log'`.
 - **With `onWriteError: 'log'`**, a failed entry is logged and the change goes through, with the chain left as it was. A database error inside the transaction itself (a write conflict, say) can still abort the transaction, change included, as any write in it would.
@@ -17,7 +19,9 @@ A tamper-evident audit trail for Payload: who changed which fields of which reco
   - `verifyAuditTrail(payload)` recomputes all of it and reports the first break, or warnings for entries waiting too long for a seal.
   - **A change is fully protected once it's sealed.** Before that, the record's head still shows a deleted or changed newest entry, but not a whole record removed along with its head.
 - **An opt-in value log** for fields you name (`values`), such as a studbook number. It keeps their old and new values. The plugin refuses at startup to log anything hidden, read-restricted, marked secret or encrypted, inside an array, a sign-in field, on your `personal` list, or a link to people not in `allowPeople`. Values are capped at 2 KB a field, readable only by `access.values` (nobody by default), and hashed separately, so clearing them keeps the chain whole.
-- **A sink for other plugins.** `recordEvent(payload, { action, subject, req, … })` writes one entry with the same rules. `fromPluginEvent(mapper)` adapts another plugin's `onEvent` in one line. It throws if the event can't be recorded, unless you choose `{ onError: 'log' }`.
+- **A sink for other plugins.** `recordEvent(payload, { action, subject, req, … })` writes one entry with the same rules. `fromPluginEvent(mapper)` adapts another plugin's `onEvent` in one line.
+  - It finds Payload from the entry's or the event's `req` or `payload`, then from `{ payload }` if you bind one (a Payload or a function returning one), then from the one Payload the plugin started on in this process. With several running, it refuses to guess: bind one.
+  - An event with a `req` that can't be recorded throws, so a plugin awaiting `onEvent` in its own transaction has its action undone. An event with no `req` has no transaction to undo, and the action has already happened, so it logs the error's name (never its message) and returns. `{ onError: 'fail' }` always throws; `{ onError: 'log' }` never does.
 - **Retention you run.** `pruneAuditTrail(payload, { valuesOlderThanDays, olderThanDays })` from your job; nothing is deleted without arguments. Entries are cut only at the end of a seal no later than the age you ask for, and a checkpoint seal records the cut first. With no such seal yet, nothing is deleted.
 
 ## On its own, and with others
@@ -48,8 +52,12 @@ export default buildConfig({
       collections: ['users', 'animals', 'pages'],
       actions: ['masquerade', 'export'],
       access: { read: isAdmin, values: isAdmin },
-      // With Hats: which account really signed in, when a hat is worn (import { hatsStateOf } from Hats in your site).
-      via: ({ req }) => { const s = hatsStateOf(req); return s?.via ? { kind: 'hats', id: String(s.via) } : null },
+      // With Hats (import { hatsStateOf } from Hats in your site): the account that really signed in, when switched,
+      // and the hat worn, as the label. Null on a plain sign-in with every role.
+      via: ({ req }) => {
+        const s = hatsStateOf(req)
+        return s?.via || s?.hat ? { kind: 'hats', id: s.via ?? null, label: s.hat ?? null } : null
+      },
       values: { animals: ['studbookNumber'] },
       personal: ['email', 'name', 'location'],
       onSeal: ({ digest, upTo }) => sendToOwner(`Audit seal ${upTo}: ${digest}`),

@@ -147,3 +147,22 @@ Gaps added: thirteen tests in all; the last two after the second read (b104d3b);
 - `onWriteError: 'log'` without transactions: the head is put back when an entry fails, and verify stays green; the chain carries on (`log-mode > without transactions…`). The check awaits `req.transactionID`, which Payload can leave as a promise of nothing.
 - `recordEvent` fills the site's own fields from `extra`, and the caller's own values win (`log-mode > fills the site's own fields…`).
 - With transactions too, a failed entry in 'log' mode puts the head back inside the transaction (`log-mode > with transactions, also puts the head back…`), found by the security read of 77186de.
+
+## 2026-11-11: passwords, unreadable fields and events without a request
+
+From the Captive Origins site's own trail (K428, its tests ported) and the combo test with MFA, Hats and Masq (branch `combo-tests`). Baseline 56 tests, now 64 on main.
+
+| Promise | Test |
+| --- | --- |
+| A password change is recorded as `password`, and nothing else on an account whose hidden fields weren't read back | audit-trail: "records a password change by name only…" |
+| The password, hash and salt are nowhere in the stored entries, heads, seals, request context or logs; verify passes, so no hash input held them either | the same |
+| An email change by name, never either address | "records an email change by name only…" (ported) |
+| A two-step change by name, never the secret | "records a two-step change by name only…" (ported) |
+| Hidden or read-restricted fields count only when the write set them | "counts a hidden or read-restricted field only when the write set it" |
+| A password on create and a reset by emailed link are recorded by name; a later sign-in records nothing | "records a password set on a new account, and a reset…" |
+| `fromPluginEvent` takes Payload from the event or a binding | "takes Payload from the event, or from a binding" |
+| Without a `req`, a failure logs the error's name only and resolves; `onError: 'fail'` rejects; with a `req` the default still rejects | "never rejects the plugin's own action without a request…" |
+| Finds the one Payload it started on; refuses to guess between two; forgets one that stopped | log-mode: "refuses to guess between two running Payloads…"; combo: the MFA event without `req` |
+| The README's `via` records the hat worn | combo: "records which hat was worn…" |
+
+Mutation-checked: each guard removed fails at least one of these tests (see the commit message). Gaps skipped: a password set by a bulk `update` with `where` is covered by the same code path as an update by id (keyed `collection:*`) and isn't tested separately.

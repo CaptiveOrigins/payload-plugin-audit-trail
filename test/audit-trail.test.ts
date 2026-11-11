@@ -1,7 +1,7 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { BasePayload, buildConfig, createLocalReq, getPayload, type CollectionConfig, type Payload, type PayloadRequest } from 'payload'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { auditTrail, fromPluginEvent, pruneAuditTrail, recordEvent, sealAuditTrail, verifyAuditTrail, type AuditTrailOptions } from '../src/index.js'
 
@@ -17,7 +17,18 @@ let admin: U
 let member: U
 let via: 'none' | 'hats' = 'none'
 
-const users: CollectionConfig = { slug: 'users', auth: true, access: { read: () => true, update: () => true }, fields: [{ name: 'name', type: 'text' }, { name: 'role', type: 'text' }] }
+// `emailChange` is hidden and `twoStep` can't be read, so the saved copy leaves both out (the site's K428 case).
+const users: CollectionConfig = {
+  slug: 'users',
+  auth: true,
+  access: { read: () => true, update: () => true },
+  fields: [
+    { name: 'name', type: 'text' },
+    { name: 'role', type: 'text' },
+    { name: 'emailChange', type: 'text', hidden: true },
+    { name: 'twoStep', type: 'group', access: { read: () => false }, fields: [{ name: 'secret', type: 'text' }, { name: 'enabledAt', type: 'date' }] },
+  ],
+}
 const entries: CollectionConfig = {
   slug: 'studbook-entries',
   versions: { drafts: { autosave: true } },
@@ -254,7 +265,7 @@ describe('a sink for other plugins', () => {
     const broken = fromPluginEvent(() => {
       throw new Error('mapper broke')
     })
-    await expect(broken({})).rejects.toThrow(/mapper broke/)
+    await expect(broken({ req })).rejects.toThrow(/mapper broke/)
     const unknown = fromPluginEvent((e: { req: PayloadRequest }) => ({ action: 'teleport', subject: { collection: 'users', id: member.id }, req: e.req }))
     await expect(unknown({ req })).rejects.toThrow(/isn't an action/)
     const lenient = fromPluginEvent(() => {
@@ -280,5 +291,143 @@ describe('retention', () => {
     const d = await pruneAuditTrail(payload, { olderThanDays: 365, now: future })
     expect(d.deleted).toBeGreaterThan(0)
     expect((await events()).length).toBe(0)
+  })
+})
+
+/** Everything stored for the trail, raw from the database, hidden fields and values included. */
+const everythingStored = async () => {
+  const raw = async (slug: string) => JSON.stringify(await payload.db.collections[slug]!.find({}).lean())
+  return (await raw('audit-events')) + (await raw('audit-events-heads')) + (await raw('audit-events-seals'))
+}
+const rawUser = async (id: string) => (await payload.db.collections.users!.findById(id).lean()) as unknown as { hash: string; salt: string }
+/** Every log line while `fn` runs, as text. */
+const logsDuring = async (fn: () => Promise<unknown>) => {
+  const lines: string[] = []
+  const spies = (['error', 'warn', 'info', 'debug', 'trace', 'fatal'] as const).map((level) => vi.spyOn(payload.logger, level).mockImplementation(((...args: unknown[]) => void lines.push(JSON.stringify(args))) as never))
+  const log = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => void lines.push(JSON.stringify(args)))
+  try {
+    await fn()
+  } finally {
+    for (const s of spies) s.mockRestore()
+    log.mockRestore()
+  }
+  return lines.join('\n')
+}
+const contextText = (req: PayloadRequest) => JSON.stringify(req.context, (_k, v) => (v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v))
+const accountUpdates = async (id: string) => events({ and: [{ subjectCollection: { equals: 'users' } }, { subjectId: { equals: id } }, { action: { equals: 'update' } }] })
+
+describe('accounts: passwords and fields the saved copy leaves out (ported from the site, K428)', () => {
+  const PASSWORD = 'Made-up-new-password-4821'
+  let person: U
+  beforeAll(async () => {
+    person = (await payload.create({ collection: 'users', data: { email: 'k428@example.invalid', password: 'Made-up-old-password-1234', role: 'member', emailChange: 'pending@example.invalid', twoStep: { secret: 'MADEUPSECRETAAAA', enabledAt: new Date().toISOString() } } as never })) as unknown as U
+  })
+
+  it('records a password change by name only: the password, hash and salt are nowhere in the trail, its context or the logs', async () => {
+    const before = (await accountUpdates(person.id)).length
+    const asAdmin = await as(admin)
+    const logs = await logsDuring(() => payload.update({ collection: 'users', id: person.id, data: { password: PASSWORD } as never, ...asAdmin }))
+    const all = await accountUpdates(person.id)
+    expect(all.length).toBe(before + 1)
+    // Only the password: emailChange and twoStep aren't read back for an admin, but they didn't change.
+    expect(all[0]).toMatchObject({ changedFields: ['password'], actor: admin.id })
+    const { hash, salt } = await rawUser(person.id)
+    const stored = await everythingStored()
+    for (const secret of [PASSWORD, hash, salt]) {
+      expect(stored).not.toContain(secret)
+      expect(logs).not.toContain(secret)
+      expect(contextText(asAdmin.req)).not.toContain(secret)
+    }
+    expect(await verifyAuditTrail(payload)).toMatchObject({ ok: true })
+  })
+
+  it('records an email change by name only, never the old or new address', async () => {
+    await payload.update({ collection: 'users', id: person.id, data: { email: 'k428-new@example.invalid' } as never, ...(await as(admin)) })
+    const [latest] = await accountUpdates(person.id)
+    expect(latest!.changedFields).toEqual(['email'])
+    const stored = await everythingStored()
+    expect(stored).not.toContain('k428-new@example.invalid')
+    expect(stored).not.toContain('k428@example.invalid')
+  })
+
+  it('records a two-step change by name only, never the secret', async () => {
+    await payload.update({ collection: 'users', id: person.id, data: { twoStep: { secret: 'ANOTHERMADEUPSECRET', enabledAt: new Date().toISOString() } } as never, overrideAccess: true, context: { audit: { origin: 'web', system: 'two-step', reason: 'test' } } })
+    const [latest] = await accountUpdates(person.id)
+    expect(latest!.changedFields).toEqual(['twoStep'])
+    expect(await everythingStored()).not.toContain('ANOTHERMADEUPSECRET')
+  })
+
+  it('counts a hidden or read-restricted field only when the write set it', async () => {
+    // A plain change, read back without either field: only the name is listed.
+    await payload.update({ collection: 'users', id: person.id, data: { name: 'Made Up Again' } as never, ...(await as(admin)) })
+    expect((await accountUpdates(person.id))[0]!.changedFields).toEqual(['name'])
+    // Set by the write, read back without it: listed.
+    await payload.update({ collection: 'users', id: person.id, data: { emailChange: 'other@example.invalid' } as never, ...(await as(admin)) })
+    expect((await accountUpdates(person.id))[0]!.changedFields).toEqual(['emailChange'])
+    const e = await newEntry({ hiddenNote: 'h1', staffNote: 's1' })
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { notes: 'only this' } as never, ...(await as(admin)) })
+    expect((await latestFor(e.id)).changedFields).toEqual(['notes'])
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { staffNote: 's2' } as never, ...(await as(admin)) })
+    expect((await latestFor(e.id)).changedFields).toEqual(['staffNote'])
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { hiddenNote: 'h2' } as never, ...(await as(admin)) })
+    expect((await latestFor(e.id)).changedFields).toEqual(['hiddenNote'])
+    // Read back with both copies holding it (overrideAccess, showHiddenFields): counted when they differ, as before.
+    await payload.update({ collection: 'studbook-entries', id: e.id, data: { notes: 'and again' } as never, overrideAccess: true, showHiddenFields: true })
+    expect((await latestFor(e.id)).changedFields).toEqual(['notes'])
+  })
+
+  it('records a password set on a new account, and a reset by emailed link, by name only', async () => {
+    const fresh = (await payload.create({ collection: 'users', data: { email: 'k428-reset@example.invalid', password: 'Made-up-first-password-77', role: 'member' } as never })) as unknown as U
+    expect((await latestFor(fresh.id)).changedFields).toContain('password')
+    const token = await payload.forgotPassword({ collection: 'users', data: { email: 'k428-reset@example.invalid' }, disableEmail: true })
+    const before = (await accountUpdates(fresh.id)).length
+    const logs = await logsDuring(() => payload.resetPassword({ collection: 'users', data: { token: String(token), password: 'Made-up-reset-password-99' }, overrideAccess: true }))
+    const all = await accountUpdates(fresh.id)
+    expect(all.length).toBe(before + 1)
+    // The holder of the link is the one acting.
+    expect(all[0]).toMatchObject({ changedFields: ['password'], actor: fresh.id })
+    const { hash, salt } = await rawUser(fresh.id)
+    const stored = await everythingStored()
+    for (const secret of ['Made-up-first-password-77', 'Made-up-reset-password-99', hash, salt, String(token)]) {
+      expect(stored).not.toContain(secret)
+      expect(logs).not.toContain(secret)
+    }
+    // A plain sign-in afterwards records nothing.
+    await payload.login({ collection: 'users', data: { email: 'k428-reset@example.invalid', password: 'Made-up-reset-password-99' } })
+    expect((await accountUpdates(fresh.id)).length).toBe(before + 1)
+    expect(await verifyAuditTrail(payload)).toMatchObject({ ok: true })
+  })
+})
+
+describe('fromPluginEvent without a request', () => {
+  // Finding the one Payload it started on is tested in log-mode.test.ts and the combo test: this file runs two.
+  it('takes Payload from the event, or from a binding', async () => {
+    const map = (e: { type: string; user: string; payload?: Payload }) => ({ action: 'hats', subject: { collection: 'users', id: e.user }, reason: e.type, ...(e.payload ? { payload: e.payload } : {}) })
+    // The entry names no payload; the event carries one.
+    await fromPluginEvent((e: { type: string; user: string; payload: Payload }) => ({ action: 'hats', subject: { collection: 'users', id: e.user }, reason: e.type }))({ type: 'from-event', user: member.id, payload })
+    await fromPluginEvent(map, { payload: () => payload })({ type: 'bound', user: member.id })
+    const got = (await events({ and: [{ action: { equals: 'hats' } }, { subjectId: { equals: member.id } }] })).map((e) => e.reason)
+    expect(got).toEqual(expect.arrayContaining(['from-event', 'bound']))
+    for (const e of await events({ reason: { in: ['from-event', 'bound'] } })) expect(e).toMatchObject({ actor: null, origin: 'script' })
+  })
+
+  it('never rejects the plugin’s own action without a request: it logs the error’s name, unless the site chose strict', async () => {
+    const unknown = (e: { user: string }) => ({ action: 'teleport', subject: { collection: 'users', id: e.user }, reason: 'secret-detail-in-message' })
+    let result: unknown = 'not run'
+    const logs = await logsDuring(async () => {
+      result = await fromPluginEvent(unknown, { payload })({ user: member.id })
+    })
+    expect(result).toBeUndefined()
+    expect(logs).toContain('Error')
+    expect(logs).not.toContain("isn't an action")
+    const broken = () => {
+      throw new TypeError('the mapper read something it should not have')
+    }
+    const brokenLogs = await logsDuring(() => fromPluginEvent(broken)({}))
+    expect(brokenLogs).toContain('TypeError')
+    expect(brokenLogs).not.toContain('should not have')
+    await expect(fromPluginEvent(unknown, { onError: 'fail', payload })({ user: member.id })).rejects.toThrow(/isn't an action/)
+    // With a request, the default still fails closed.
+    await expect(fromPluginEvent((e: { req: PayloadRequest }) => ({ ...unknown({ user: member.id }), req: e.req }))({ req: (await as(admin)).req })).rejects.toThrow(/isn't an action/)
   })
 })

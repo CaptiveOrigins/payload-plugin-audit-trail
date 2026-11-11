@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## Unreleased
+
+- Setting a password (create, update, or a reset by emailed link) records `password` by name. Only the hash and salt change, and those are never listed, so it used to leave no entry. The plugin keeps the names of the fields a write sent, and whether it set a password, in `req.context`: never a value. Found by the Captive Origins site (K428); its tests are ported.
+- A hidden or read-restricted field no longer shows as changed on every update. The saved copy leaves it out when it isn't read back; it now counts only if the write set it, or both copies hold it and differ.
+- `fromPluginEvent` finds Payload when an event has no `req`: from the event's `payload`, a `{ payload }` binding, or the one Payload the plugin started on (it refuses to guess between several). MFA's `start(payload, { userId })` raises such an event.
+- `fromPluginEvent` no longer rejects a plugin's action when an event without a `req` can't be recorded: there's no transaction to undo, so it logs the error's name and returns. With a `req` it still fails closed. `onError: 'fail'` is the new strict mode; `onError: 'log'` is as before, now logging the name only.
+- The README's `via` example records the Hats hat worn as well as the account, as Hats' README promises.
+
+## 0.1.0 (not yet published)
 
 - From the 2026-11-10 test self-audit: with `onWriteError: 'log'`, a failed entry can no longer undo the change it records (it's written through the database adapter in that mode), and without transactions the chain's head is put back when an entry fails, so verify never reports a break that didn't happen. Events recorded through `recordEvent` get the site's own fields from its `extra` resolver unless the caller gave them.
 

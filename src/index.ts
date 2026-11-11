@@ -2,6 +2,7 @@ import type {
   Access,
   CollectionAfterChangeHook,
   CollectionAfterDeleteHook,
+  CollectionAfterLoginHook,
   CollectionAfterOperationHook,
   CollectionBeforeOperationHook,
   CollectionConfig,
@@ -124,11 +125,24 @@ export const same = (a: unknown, b: unknown): boolean => {
   return JSON.stringify(a ?? null) === JSON.stringify(b ?? null)
 }
 
-const changed = (doc: Record<string, unknown>, previous: Record<string, unknown> | undefined, skip: Set<string>) =>
-  [...new Set([...Object.keys(doc ?? {}), ...Object.keys(previous ?? {})])]
+/** What a write itself sent, kept in `req.context` between `beforeOperation` and `afterChange`: field names and whether a password was set. Never values. */
+export type Sent = { keys: string[]; password: boolean }
+
+/**
+ * The top-level fields that changed. A hidden or read-restricted field (`unreadable`) can be missing from the saved
+ * copy only because it wasn't read back, so being in one copy alone isn't a change: it counts if this write set it,
+ * or if both copies have it and they differ. A write that set a password changes only the hash and salt, which are
+ * never listed, so it lists `password`, by name only.
+ */
+export const changed = (doc: Record<string, unknown>, previous: Record<string, unknown> | undefined, skip: Set<string>, unreadable: Set<string> = new Set(), sent?: Sent) => {
+  const set = new Set(sent?.keys ?? [])
+  const fields = [...new Set([...Object.keys(doc ?? {}), ...Object.keys(previous ?? {})])]
     .filter((k) => !skip.has(k) && !k.startsWith('_'))
+    .filter((k) => !(previous && unreadable.has(k) && k in previous !== k in (doc ?? {}) && !set.has(k)))
     .filter((k) => !same(doc?.[k] ?? null, previous?.[k] ?? null))
-    .sort()
+  if (sent?.password) fields.push('password')
+  return [...new Set(fields)].sort()
+}
 
 const idOf = (v: unknown) => (v && typeof v === 'object' && 'id' in v ? (v as { id: unknown }).id : v)
 
@@ -229,6 +243,31 @@ function skipped(req: PayloadRequest, name: 'auditTrailAutosave' | 'auditTrailRe
   return made
 }
 
+const sentKey = (slug: string, op: 'create' | 'update', id?: unknown) => (op === 'create' ? `${slug}:+` : id === undefined || id === null ? `${slug}:*` : `${slug}:${String(id)}`)
+function sentBy(req: PayloadRequest): Map<string, Sent> {
+  req.context ??= {}
+  if (!(req.context.auditTrailSent instanceof Map)) req.context.auditTrailSent = new Map<string, Sent>()
+  return req.context.auditTrailSent as Map<string, Sent>
+}
+function resetting(req: PayloadRequest): Set<string> {
+  req.context ??= {}
+  if (!(req.context.auditTrailReset instanceof Set)) req.context.auditTrailReset = new Set<string>()
+  return req.context.auditTrailReset as Set<string>
+}
+
+/** Top-level fields the saved copy may leave out because they aren't read back: hidden, or with their own read access. From the built config, so fields other plugins add count too. */
+const unreadableCache = new WeakMap<object, Set<string>>()
+function unreadableIn(payload: Payload, slug: string): Set<string> {
+  const config = payload.collections?.[slug as never]?.config as { flattenedFields?: AnyField[] } | undefined
+  if (!config) return new Set()
+  let found = unreadableCache.get(config)
+  if (!found) {
+    found = new Set((config.flattenedFields ?? []).filter((f) => f.name && (f.hidden || f.access?.read)).map((f) => String(f.name)))
+    unreadableCache.set(config, found)
+  }
+  return found
+}
+
 const contextOf = (req: PayloadRequest): AuditContext | false => (req.context?.audit === false ? false : ((req.context?.audit as AuditContext | undefined) ?? {}))
 
 /**
@@ -244,28 +283,49 @@ export async function recordEvent(payload: Payload, entry: AuditEntry) {
   await write(payload, o, { ...entry, extra: { ...siteExtra, ...(entry.extra ?? {}) }, actor: entry.actor !== undefined ? entry.actor : base.actor, via: entry.via !== undefined ? entry.via : base.via })
 }
 
+/** Every Payload this plugin started on in this process, for events that arrive with neither `req` nor `payload`. */
+const started = new Set<Payload>()
+
+type EventLike = { req?: PayloadRequest; payload?: Payload } | null | undefined
+
 /**
  * Adapts another plugin's `onEvent` in one line. The mapper turns an event into an entry (or null to skip it on
- * purpose). If the mapper throws, or the entry's action isn't known, this throws too, so a security event that
- * can't be recorded fails the operation that raised it (when that plugin awaits `onEvent` inside its own
- * transaction, the operation is undone). `{ onError: 'log' }` is the explicit opt-out for events that are only informational.
+ * purpose). Payload is found from the entry's `req` or `payload`, then the event's, then `opts.payload`, then the one
+ * Payload this plugin started on in this process (refused if there are several: bind one).
+ *
+ * When the entry can't be recorded (the mapper throws, the action isn't known, the write fails):
+ * - `onError: 'fail'` throws, always.
+ * - `onError: 'log'` logs the error's name and returns, always.
+ * - By default it throws when the event came with a `req`, so a plugin that awaits `onEvent` inside its own
+ *   transaction has its action undone, as a failed entry undoes a change. Without a `req` there's no transaction
+ *   to undo, and the plugin's action has already happened, so it logs and returns instead of failing it.
  */
-export function fromPluginEvent<E>(mapper: (event: E) => AuditEntry | null | Promise<AuditEntry | null>, opts: { onError?: 'fail' | 'log' } = {}) {
+export function fromPluginEvent<E>(
+  mapper: (event: E) => AuditEntry | null | Promise<AuditEntry | null>,
+  opts: { onError?: 'fail' | 'log'; payload?: Payload | (() => Payload | Promise<Payload>) } = {},
+) {
   return async (event: E) => {
+    const ev = (isObject(event) ? event : undefined) as EventLike
+    let entry: AuditEntry | null = null
     let p: Payload | undefined
     try {
-      const entry = await mapper(event)
+      entry = await mapper(event)
       if (!entry) return
-      p = entry.req?.payload ?? entry.payload
-      if (!p) throw new Error('audit-trail: an event entry needs `req` or `payload`.')
+      p = entry.req?.payload ?? entry.payload ?? ev?.req?.payload ?? ev?.payload ?? (typeof opts.payload === 'function' ? await opts.payload() : opts.payload)
+      if (!p) {
+        if (started.size > 1) throw new Error('audit-trail: an event came with no `req` or `payload`, and several Payloads run in this process; pass `{ payload }` to fromPluginEvent.')
+        p = [...started][0]
+      }
+      if (!p) throw new Error('audit-trail: an event came with no `req` or `payload`, and the plugin hasn\u2019t started on any Payload yet.')
       await recordEvent(p, entry)
     } catch (error) {
-      if (opts.onError === 'log') {
-        const logger = p?.logger ?? (event as { req?: PayloadRequest; payload?: Payload })?.req?.payload?.logger ?? (event as { payload?: Payload })?.payload?.logger
-        logger?.error({ err: error, msg: 'audit-trail: a plugin event was not recorded (onError: log)' })
-        return
-      }
-      throw error
+      const strict = opts.onError === 'fail' || (opts.onError !== 'log' && Boolean(entry?.req ?? ev?.req))
+      if (strict) throw error
+      // The name only: a message can carry what the event was about.
+      const logger = p?.logger ?? ev?.req?.payload?.logger ?? ev?.payload?.logger ?? (started.size === 1 ? [...started][0]!.logger : undefined)
+      const name = (error as Error | undefined)?.name ?? typeof error
+      if (logger) logger.error({ msg: `audit-trail: a plugin event was not recorded (${name})${entry ? `: ${entry.action} on ${entry.subject.collection}` : ''}` })
+      else console.error(`audit-trail: a plugin event was not recorded (${name})`)
     }
   }
 }
@@ -635,12 +695,12 @@ export const auditTrail =
     if (o.collections.includes(o.slug)) throw new Error('audit-trail: the trail can’t record itself.')
     checkValueFields(config, o, opts)
 
-    const record = async (action: 'create' | 'update' | 'delete', slug: string, doc: Record<string, unknown>, previous: Record<string, unknown> | undefined, req: PayloadRequest, skip: Set<string>) => {
+    const record = async (action: 'create' | 'update' | 'delete', slug: string, doc: Record<string, unknown>, previous: Record<string, unknown> | undefined, req: PayloadRequest, skip: Set<string>, sent?: Sent) => {
       const audit = contextOf(req)
       if (audit === false) return
       // A draft's autosave of this very record isn't recorded (publishing and saving are); keyed to the record, never the whole request.
       if (action === 'update' && skipped(req, 'auditTrailAutosave').has(`${slug}:${String(doc.id)}`)) return
-      const fields = action === 'delete' ? [] : changed(doc, action === 'create' ? undefined : previous, skip)
+      const fields = action === 'delete' ? [] : changed(doc, action === 'create' ? undefined : previous, skip, unreadableIn(req.payload, slug), sent)
       if (action === 'update' && fields.length === 0) return
       const restored = action === 'update' ? (skipped(req, 'auditTrailRestore') as Map<string, string>).get?.(`${slug}:${String(doc.id)}`) : undefined
       const { actor, via } = await who(o, req)
@@ -675,7 +735,14 @@ export const auditTrail =
           const skip = new Set([...o.ignore, ...(collection.fields as AnyField[]).filter((f) => f.type === 'join').map((f) => String(f.name))])
           const autosaves = Boolean(collection.versions && typeof collection.versions === 'object' && collection.versions.drafts && typeof collection.versions.drafts === 'object' && collection.versions.drafts.autosave)
           const beforeOperation: CollectionBeforeOperationHook = async ({ args, operation, req }) => {
-            const a = args as { autosave?: boolean; draft?: boolean; id?: string | number }
+            const a = args as { autosave?: boolean; draft?: boolean; id?: string | number; data?: unknown }
+            // What this write itself sent: the change hooks only see the merged record. Names only, and whether a password was set.
+            if (operation === 'create' || operation === 'update') {
+              const data = isObject(a.data) ? a.data : {}
+              sentBy(req).set(sentKey(collection.slug, operation, a.id), { keys: Object.keys(data), password: typeof data.password === 'string' && data.password.length > 0 })
+            }
+            // A password reset writes straight to the database, so no change hook sees it; afterLogin, inside its transaction, records it.
+            if (operation === 'resetPassword') resetting(req).add(collection.slug)
             if (operation === 'update' && a.id !== undefined) {
               const key = `${collection.slug}:${String(a.id)}`
               // Only a real draft autosave: the collection autosaves drafts, it's a draft, and it's this record.
@@ -690,8 +757,16 @@ export const auditTrail =
             return args
           }
           const afterChange: CollectionAfterChangeHook = async ({ doc, operation, previousDoc, req }) => {
-            await record(operation, collection.slug, doc, previousDoc, req, skip)
+            const sends = sentBy(req)
+            const sent = operation === 'create' ? sends.get(sentKey(collection.slug, 'create')) : (sends.get(sentKey(collection.slug, 'update', doc.id as string)) ?? sends.get(sentKey(collection.slug, 'update')))
+            await record(operation, collection.slug, doc, previousDoc, req, skip, sent)
             return doc
+          }
+          const afterLogin: CollectionAfterLoginHook = async ({ req, user }) => {
+            if (!resetting(req).delete(collection.slug)) return
+            // The same copy on both sides: nothing but the password is listed. The account that held the link is the actor.
+            const doc = user as unknown as Record<string, unknown>
+            await record('update', collection.slug, doc, doc, req, skip, { keys: [], password: true })
           }
           const afterDelete: CollectionAfterDeleteHook = async ({ doc, req }) => {
             await record('delete', collection.slug, doc, undefined, req, skip)
@@ -699,7 +774,9 @@ export const auditTrail =
           }
           const afterOperation: CollectionAfterOperationHook = ({ args, operation, req, result }) => {
             const id = (args as { id?: string | number }).id
-            if (operation === 'update' && id !== undefined) skipped(req, 'auditTrailAutosave').delete(`${collection.slug}:${String(id)}`)
+            if ((operation === 'update' || operation === 'updateByID') && id !== undefined) skipped(req, 'auditTrailAutosave').delete(`${collection.slug}:${String(id)}`)
+            if (operation === 'create' || operation === 'update' || operation === 'updateByID') sentBy(req).delete(sentKey(collection.slug, operation === 'create' ? 'create' : 'update', id))
+            if (operation === 'resetPassword') resetting(req).delete(collection.slug)
             if (operation === 'restoreVersion') {
               const parent = (result as { id?: unknown } | undefined)?.id
               if (parent !== undefined) (skipped(req, 'auditTrailRestore') as Map<string, string>).delete(`${collection.slug}:${String(parent)}`)
@@ -714,6 +791,7 @@ export const auditTrail =
               afterChange: [...(collection.hooks?.afterChange ?? []), afterChange],
               afterDelete: [...(collection.hooks?.afterDelete ?? []), afterDelete],
               afterOperation: [...(collection.hooks?.afterOperation ?? []), afterOperation],
+              ...(collection.auth ? { afterLogin: [...(collection.hooks?.afterLogin ?? []), afterLogin] } : {}),
             },
           }
         }),
@@ -724,6 +802,13 @@ export const auditTrail =
       onInit: async (payload) => {
         await onInit?.(payload)
         if (o.onWriteError === 'fail') await assertTransactions(payload, o)
+        // Forget it when it stops, so an event never lands on a Payload that's gone.
+        started.add(payload)
+        const destroy = payload.destroy.bind(payload)
+        payload.destroy = async () => {
+          started.delete(payload)
+          return destroy()
+        }
       },
     }
   }
