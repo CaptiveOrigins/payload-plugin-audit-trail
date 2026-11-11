@@ -361,7 +361,7 @@ export function fromPluginEvent<E>(
 }
 
 type Entry = Record<string, any> & { id: string | number; at: string; hash: string; prevHash?: string | null; seq: number; chainKey: string }
-type Seal = { id: string | number; kind: 'seal' | 'checkpoint' | 'adoption'; seq: number; prevDigest?: string | null; digest: string; fromAt?: string | null; upTo: string; count: number }
+type Seal = { id: string | number; kind: 'seal' | 'checkpoint' | 'adoption'; seq: number; prevDigest?: string | null; digest: string; fromAt?: string | null; upTo: string; count: number; pins?: string[] | null }
 
 const allSorted = async (payload: Payload, slug: string, where: Record<string, unknown> = {}, sort: string[] = ['at', 'id'], req?: PayloadRequest) =>
   (await payload.find({ collection: slug as never, where: where as never, sort, limit: 0, pagination: false, depth: 0, overrideAccess: true, showHiddenFields: true, ...(req ? { req } : {}) })).docs as unknown as Record<string, any>[]
@@ -491,11 +491,21 @@ export async function pruneAuditTrail(payload: Payload, args: { olderThanDays?: 
     const boundary = (await allSorted(payload, o.seals, { and: [{ kind: { equals: 'seal' } }, { upTo: { less_than_equal: asked } }] }, ['-upTo']))[0] as Seal | undefined
     if (boundary) {
       const cut = new Date(boundary.upTo).toISOString()
-      const checkpoint = await writeSeal(payload, o, async (last) => ({ kind: 'checkpoint', fromAt: null, upTo: cut, count: 0, digest: sealDigest(last?.digest ?? null, [], cut, 'checkpoint') }))
-      if (!checkpoint) throw new Error('audit-trail: a seal ran at the same moment; prune again.')
       // Adopted entries go only once the cut passes the whole adoption, so its digest can still be checked until then.
       const adoption = (await allSorted(payload, o.seals, { kind: { equals: 'adoption' } }))[0] as Seal | undefined
       const keepAdopted = adoption && new Date(adoption.upTo).toISOString() > cut
+      // The checkpoint records, inside its digest, the digest of each seal this cut removes that a seal left behind
+      // still links to (`pins`). Verify accepts a seal whose predecessor is gone only where a checkpoint pinned
+      // it, so nothing but a recorded cut can excuse a missing seal. Read in the checkpoint's own transaction.
+      const checkpoint = await writeSeal(payload, o, async (last, req) => {
+        const all = (await allSorted(payload, o.seals, {}, ['seq'], req)) as unknown as Seal[]
+        const goes = (s: Seal) => (s.kind === 'seal' && new Date(s.upTo).toISOString() <= cut) || (s.kind === 'adoption' && !keepAdopted)
+        const gone = new Set(all.filter(goes).map((s) => s.digest))
+        // An adoption seal on its way out is pinned like one that stays: if its delete never happens, it still verifies.
+        const pins = [...new Set([...all.filter((s) => !goes(s) || s.kind === 'adoption').map((s) => s.prevDigest), last?.digest].filter((d): d is string => Boolean(d) && gone.has(d!)))]
+        return { kind: 'checkpoint', fromAt: null, upTo: cut, count: 0, pins, digest: sealDigest(last?.digest ?? null, pins, cut, 'checkpoint') }
+      })
+      if (!checkpoint) throw new Error('audit-trail: a seal ran at the same moment; prune again.')
       const r = await payload.delete({ collection: o.slug as never, where: { and: [{ at: { less_than_equal: cut } }, ...(keepAdopted ? [{ hash: { exists: true } }] : [])] } as never, overrideAccess: true })
       deleted = r.docs.length
       await payload.db.deleteMany({ collection: o.seals, where: { and: [{ kind: { equals: 'seal' } }, { upTo: { less_than_equal: cut } }] } as never })
@@ -812,9 +822,16 @@ export async function verifyAuditTrail(payload: Payload, args: VerifyArgs = {}):
     for await (const row of ordered(o.seals, walkFrom === null ? [] : [{ seq: { greater_than_equal: walkFrom } }], ['seq'])) {
       const s = row as unknown as Seal
       sealsRead++
-      if (prevSeal && s.prevDigest !== prevSeal.digest) throw new Stop(String(s.id), 'a seal doesn’t link to the seal before it')
+      // Each seal links to the one before it. Where that one is gone, a checkpoint from here on must have recorded
+      // cutting it away (its digest among the checkpoint's pins, which the checkpoint's own digest covers). Only
+      // the trail's very first seal links to nothing, and the seal a `from` check starts at is taken as given.
+      const start = prevSeal ? false : anchor ? String(s.id) === String(anchor.id) : !s.prevDigest
+      if (!start && !(prevSeal && s.prevDigest === prevSeal.digest)) {
+        const pinned = s.prevDigest ? await find(`the seal before seal ${s.seq}`, o.seals, { and: [{ kind: { equals: 'checkpoint' } }, { pins: { in: [s.prevDigest] } }, { seq: { greater_than_equal: s.seq } }] }, ['seq'], 1) : []
+        if (!pinned.length) throw new Stop(String(s.id), 'a seal doesn’t link to the seal before it')
+      }
       if (s.kind === 'checkpoint') {
-        if (sealDigest(s.prevDigest ?? null, [], s.upTo, 'checkpoint') !== s.digest) throw new Stop(String(s.id), 'a checkpoint was changed')
+        if (sealDigest(s.prevDigest ?? null, s.pins ?? [], s.upTo, 'checkpoint') !== s.digest) throw new Stop(String(s.id), 'a checkpoint was changed')
       } else if (s.kind === 'adoption') {
         // Once a checkpoint cut past the whole adoption, its entries are gone by design and only the link is checked.
         const prunedPast = checkpoint && checkpoint.upTo >= new Date(s.upTo).toISOString()
@@ -887,6 +904,8 @@ function chainCollections(o: Resolved): CollectionConfig[] {
         { name: 'fromAt', type: 'date' },
         { name: 'upTo', type: 'date', required: true, index: true },
         { name: 'count', type: 'number', required: true },
+        // On a checkpoint: the digests of the seals its cut removed that a remaining seal still links to.
+        { name: 'pins', type: 'text', hasMany: true },
       ],
     },
   ]

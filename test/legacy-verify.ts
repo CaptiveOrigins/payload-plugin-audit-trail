@@ -3,14 +3,16 @@ import type { Payload } from 'payload'
 import { entryHash, SEAL_KEY, sealDigest, valuesHash } from '../src/chain.js'
 
 /**
- * The verify this plugin shipped before it streamed (K33), kept word for word as a reference: it reads the whole
- * trail into memory. The streaming verify must give the same answer on every trail these tests build.
+ * The verify this plugin shipped before it streamed (K33), kept as a reference: it reads the whole trail into
+ * memory. The streaming verify must give the same answer on every trail these tests build. It is word for word
+ * the old one except for the seal-link rule, which changed for both when a second prune was found to leave a
+ * false break (a seal whose predecessor is gone must be pinned by a checkpoint).
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export type LegacyResult = { ok: boolean; checked: number; firstBreak?: { id: string; reason: string }; warnings: string[] }
 type Options = { slug: string; heads: string; seals: string; extraNames: string[]; sealEveryHours: number; sealGraceMinutes: number }
 type Entry = Record<string, any> & { id: string | number; at: string; hash: string; prevHash?: string | null; seq: number; chainKey: string }
-type Seal = { id: string | number; kind: 'seal' | 'checkpoint' | 'adoption'; seq: number; prevDigest?: string | null; digest: string; fromAt?: string | null; upTo: string; count: number }
+type Seal = { id: string | number; kind: 'seal' | 'checkpoint' | 'adoption'; seq: number; prevDigest?: string | null; digest: string; fromAt?: string | null; upTo: string; count: number; pins?: string[] | null }
 
 const optionsOf = (payload: Payload) => payload.config.custom!.auditTrail as Options
 const valuesHashOf = (values: unknown) => valuesHash(values)
@@ -71,9 +73,11 @@ export async function legacyVerify(payload: Payload, args: { since?: Date; now?:
   // 3. Seals: each digest from the entries in its range, each linked to the one before.
   let prevSeal: Seal | null = null
   for (const s of seals) {
-    if (prevSeal && s.prevDigest !== prevSeal.digest) return fail(s.id, 'a seal doesn’t link to the seal before it', checked)
+    const start = !prevSeal && !s.prevDigest
+    const pinned = seals.some((c) => c.kind === 'checkpoint' && c.seq >= s.seq && Boolean(s.prevDigest) && (c.pins ?? []).includes(s.prevDigest!))
+    if (!start && !(prevSeal && s.prevDigest === prevSeal.digest) && !pinned) return fail(s.id, 'a seal doesn’t link to the seal before it', checked)
     if (s.kind === 'checkpoint') {
-      if (sealDigest(s.prevDigest ?? null, [], s.upTo, 'checkpoint') !== s.digest) return fail(s.id, 'a checkpoint was changed', checked)
+      if (sealDigest(s.prevDigest ?? null, s.pins ?? [], s.upTo, 'checkpoint') !== s.digest) return fail(s.id, 'a checkpoint was changed', checked)
     } else if (s.kind === 'adoption') {
       // Once a checkpoint cut past the whole adoption, its entries are gone by design and only the link is checked.
       const prunedPast = checkpoint && checkpoint.upTo >= new Date(s.upTo).toISOString()

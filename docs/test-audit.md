@@ -207,7 +207,7 @@ After the third read (approved f8cdfb4), 79 tests: "two nested writes to one rec
 
 ## 2026-11-11: verify a page at a time (K33)
 
-Baseline 79 tests, now 101: 22 in `test/verify-stream.test.ts`, on the same in-memory MongoDB replica set. `test/legacy-verify.ts` is the old verify, word for word; "agrees" below means the streaming verify's `ok`, `checked`, `firstBreak` and `warnings` equal its answer at page sizes 1, 2, 3 and 1,000.
+Baseline 79 tests, now 106: 27 in `test/verify-stream.test.ts` (22 for streaming, 5 for the prune fix below), on the same in-memory MongoDB replica set. `test/legacy-verify.ts` is the old verify, word for word; "agrees" below means the streaming verify's `ok`, `checked`, `firstBreak` and `warnings` equal its answer at page sizes 1, 2, 3 and 1,000.
 
 | Promise | Test |
 | --- | --- |
@@ -268,5 +268,27 @@ Two guards survived the first pass and were removed as redundant, each already c
 
 **For the lead (found here, not fixed):**
 
-1. **A second prune can leave verify reporting a break that isn't one.** With a checkpoint from an earlier prune still in the seal chain, a later prune that deletes the seal written right after it leaves the next seal linking to a seal that's gone, and verify says "a seal doesn't link to the seal before it". The old verify does the same (it's the seal walk both share, kept identical here on purpose). Seen in a throwaway probe: seal, seal, prune at the first, two more seals, prune at the third. A site that prunes on a schedule will hit it. The fix belongs in prune or in the link rule, with its own security read.
+1. **A second prune left verify reporting a break that wasn't one.** Fixed in the next section.
 2. `sealAuditTrail` still reads one interval's entries at once, and `adoptExistingEntries` the whole old log in one transaction.
+
+## 2026-11-11: pruning more than once (K33, second pass)
+
+The three tests in "pruning more than once" were written first and failed on 6a71c03: the first two on the false break, the third because removing a trail's first seal with its entries passed verify. `test/legacy-verify.ts` carries the same new link rule, so the two verifies are still compared.
+
+| Promise | Test |
+| --- | --- |
+| Verify stays ok after a second and a third prune, at page sizes 1, 2 and 1,000, and from the checkpoint | "verify stays ok after a second prune, and a third…" |
+| After two prunes a changed entry, a sealed record removed, and a surviving seal removed are each a break | "a real break after two prunes is still caught…" |
+| A checkpoint's pins can't be widened or dropped; a seal can't claim to be the first mid-chain | the same |
+| A trail's first seal can't be removed quietly | "the first seal of a trail that was never pruned…" |
+| A made-up checkpoint, or a pin written onto an ordinary seal, excuses nothing, in a full check or one from a seal | "a made-up checkpoint can't excuse a missing seal…" |
+| The paging index is in the collection's config, and verify gives the same answers with it dropped | "the paging index is part of the collection's config…" |
+| A crashed prune that leaves the adoption seal behind still verifies down to its real finding | adopt: "still checks unhashed entries if an adoption seal was left behind…" (unchanged, kept passing) |
+
+**Mutation check**, in a copy of the repo, as before. All 8 made a test fail: prune recording no pins; any missing seal excused; a pin taken from a checkpoint the check never reads; the first seal read needing no link (the old rule); a departing adoption seal not pinned; the checkpoint's own link not pinned; pins left out of the checkpoint's digest check; pins accepted from a seal that isn't a checkpoint (this one survived until its test was added).
+
+**Gaps skipped, and why:**
+
+- A database writer who appends a made-up checkpoint at the newest end and moves the seal head: verify can't catch that, as with any consistent rewrite. The README says `onSeal` is the defense.
+- A trail pruned by a build from before this change: it reports a link break by design; nothing was published with that format.
+- A prune racing a seal: the checkpoint is written with the conditional seal head, as before ("two seals at once…").

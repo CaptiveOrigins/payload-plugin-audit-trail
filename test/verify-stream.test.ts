@@ -643,3 +643,112 @@ describe('failing closed when the trail can’t be read properly', () => {
     expect(again).toMatchObject({ ok: false, finished: false, firstBreak: { id: expect.stringMatching(/^notes:made-\d$/), reason: expect.stringMatching(/out of order/) } })
   })
 })
+
+describe('pruning more than once', () => {
+  /** Two seals, a prune at the first, two more seals, a prune at the third: one seal survives between two checkpoints. */
+  async function prunedTwice() {
+    const first = await make('first')
+    const s1 = await sealNow()
+    await make('second')
+    await sealNow()
+    await pruneAuditTrail(p, { olderThanDays: 0, now: new Date(new Date(s1.upTo).getTime() + 1) })
+    expect((await verifyAuditTrail(p)).firstBreak).toBeUndefined()
+    await make('third')
+    const s4 = await sealNow()
+    const kept = await make('kept')
+    await edit(first.id, { text: 'first, again' })
+    const s5 = await sealNow()
+    await pruneAuditTrail(p, { olderThanDays: 0, now: new Date(new Date(s4.upTo).getTime() + 1) })
+    return { kept, s5 }
+  }
+
+  it('verify stays ok after a second prune, and a third, at any page size and from the checkpoint', async () => {
+    const { s5 } = await prunedTwice()
+    expect((await seals()).map((s) => `${s.seq} ${s.kind}`)).toEqual(['3 checkpoint', '5 seal', '6 checkpoint'])
+    for (const pageSize of [1, 2, 1000]) expect(await verifyAuditTrail(p, { pageSize }), `page size ${pageSize}`).toMatchObject({ ok: true, checked: 2 })
+    expect(core(await verifyAuditTrail(p))).toEqual(core(await legacyVerify(p)))
+    expect(await verifyAuditTrail(p, { from: sealed.at(-1)!.digest })).toMatchObject({ ok: true, checked: 2, partial: true })
+    // A third prune, at the newest seal, leaves three checkpoints and nothing else.
+    await make('fourth')
+    await pruneAuditTrail(p, { olderThanDays: 0, now: new Date(new Date(s5.upTo).getTime() + 1) })
+    expect((await seals()).map((s) => s.kind)).toEqual(['checkpoint', 'checkpoint', 'checkpoint'])
+    expect(await verifyAuditTrail(p)).toMatchObject({ ok: true, checked: 1 })
+    await sealNow()
+    expect(await agree()).toMatchObject({ ok: true, checked: 1 })
+  })
+
+  it('a real break after two prunes is still caught: pruning excuses only what it recorded', async () => {
+    const { kept } = await prunedTwice()
+    const [c1, s5, c2] = await seals()
+    const restore = async (s: Doc) => raw(SEALS).insertOne({ ...s, _id: undefined, id: undefined, upTo: new Date(s.upTo), ...(s.fromAt ? { fromAt: new Date(s.fromAt) } : {}) })
+    // An entry changed, and a sealed record removed with its head.
+    const entry = (await trail()).find((e) => e.chainKey === `notes:${kept.id}`)!
+    await raw(EVENTS).updateOne({ hash: entry.hash }, { $set: { reason: 'made up' } })
+    expect((await agree()).firstBreak?.reason).toMatch(/changed after it was written/)
+    await raw(EVENTS).updateOne({ hash: entry.hash }, { $unset: { reason: '' } })
+    await raw(EVENTS).deleteOne({ hash: entry.hash })
+    await raw(HEADS).deleteOne({ key: entry.chainKey })
+    expect((await agree()).firstBreak?.reason).toMatch(/sealed range/)
+    // The surviving seal removed along with it, as if a prune had taken both: no checkpoint recorded that.
+    await raw(SEALS).deleteOne({ seq: 5 })
+    expect((await agree()).firstBreak).toEqual({ id: String(c2!.id), reason: 'a seal doesn’t link to the seal before it' })
+    await restore(s5!)
+    await raw(EVENTS).insertOne({ ...entry, _id: undefined, id: undefined, at: new Date(entry.at) })
+    await raw(HEADS).insertOne({ key: entry.chainKey, hash: entry.hash, seq: 1, at: new Date(entry.at) })
+    expect((await agree()).ok).toBe(true)
+    // What a checkpoint recorded as cut away can't be widened, dropped, or borrowed from an earlier checkpoint.
+    expect(c2!.pins).toHaveLength(2)
+    await raw(SEALS).updateOne({ seq: 6 }, { $set: { pins: [...c2!.pins, s5!.digest] } })
+    expect((await agree()).firstBreak?.reason).toBe('a checkpoint was changed')
+    await raw(SEALS).updateOne({ seq: 6 }, { $set: { pins: [] } })
+    expect((await agree()).firstBreak?.reason).toMatch(/doesn’t link|checkpoint was changed/)
+    await raw(SEALS).updateOne({ seq: 6 }, { $set: { pins: c2!.pins } })
+    await raw(SEALS).updateOne({ seq: 3 }, { $set: { pins: c2!.pins, seq: 7 } })
+    expect((await agree()).ok).toBe(false)
+    await raw(SEALS).updateOne({ seq: 7 }, { $set: { pins: c1!.pins, seq: 3 } })
+    expect((await agree()).ok).toBe(true)
+    // A seal that claims to be the first, in the middle of the chain.
+    await raw(SEALS).updateOne({ seq: 5 }, { $unset: { prevDigest: '' } })
+    expect((await agree()).ok).toBe(false)
+  })
+
+  it('a made-up checkpoint can’t excuse a missing seal, in a full check or one from a seal', async () => {
+    await story()
+    const [s1, s2] = await seals()
+    await raw(SEALS).deleteOne({ seq: 2 })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
+    // A pin written onto an ordinary seal, whose digest doesn't cover it, counts for nothing.
+    await raw(SEALS).updateOne({ seq: 3 }, { $set: { pins: [s2!.digest] } })
+    expect((await agree()).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
+    // Well-formed, pinning the seal that's gone, and numbered before everything so a check from seal 1 never reads it.
+    const upTo = new Date(Date.now() - DAY)
+    await raw(SEALS).insertOne({ kind: 'checkpoint', seq: 0, digest: sealDigest(null, [s2!.digest], upTo.toISOString(), 'checkpoint'), upTo, count: 0, pins: [s2!.digest] })
+    expect((await agree()).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
+    expect((await verifyAuditTrail(p, { from: s1!.digest })).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
+  })
+
+  it('the paging index is part of the collection’s config, and verify still works without it', async () => {
+    const config = p.collections[EVENTS as never] as unknown as { config: { indexes?: { fields: string[] }[] } }
+    expect(config.config.indexes).toEqual([{ fields: ['chainKey', 'seq'] }])
+    const name = ((await raw(EVENTS).indexes()) as { name: string; key: Doc }[]).find((i) => JSON.stringify(i.key) === '{"chainKey":1,"seq":1}')?.name
+    expect(name).toBeTruthy()
+    await story()
+    await raw(EVENTS).dropIndex(name)
+    try {
+      expect(await agree()).toMatchObject({ ok: true, checked: 10 })
+    } finally {
+      await raw(EVENTS).createIndex({ chainKey: 1, seq: 1 }, { name })
+    }
+  })
+
+  it('the first seal of a trail that was never pruned can’t be removed quietly', async () => {
+    const a = await make('a')
+    await sealNow()
+    await make('b')
+    await sealNow()
+    await raw(SEALS).deleteOne({ seq: 1 })
+    await raw(EVENTS).deleteMany({ chainKey: `notes:${a.id}` })
+    await raw(HEADS).deleteOne({ key: `notes:${a.id}` })
+    expect((await agree()).firstBreak?.reason).toBe('a seal doesn’t link to the seal before it')
+  })
+})
