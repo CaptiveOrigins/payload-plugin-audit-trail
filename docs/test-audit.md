@@ -140,3 +140,9 @@ Gaps, skipped with reason: Postgres (not supported in 0.1, said in Limits); a ve
 | An empty hash counts as unhashed in adoption and verify | `adopt > treats an empty hash…` |
 
 Gaps added: thirteen tests in all; the last two after the second read (b104d3b); the last four after the security read of 0d94668 found the seal-continuation blocker, the values gap and the untested leftover check. A mutation check catches every guard but one: leaving the values hash out of the adoption digest survives, because verify's own values check on unhashed entries already catches the same edits. Gaps skipped: an adoption racing a prune isn't tested directly (its reads moved into the seal's transaction, whose head move decides the race, as for seals).
+
+## 2026-11-10: the self-audit's bugs, fixed
+
+- `onWriteError: 'log'` with transactions: a change whose entry would fail validation is kept, and its entry written (`log-mode > with transactions…`).
+- `onWriteError: 'log'` without transactions: the head is put back when an entry fails, and verify stays green; the chain carries on (`log-mode > without transactions…`). The check awaits `req.transactionID`, which Payload can leave as a promise of nothing.
+- `recordEvent` fills the site's own fields from `extra`, and the caller's own values win (`log-mode > fills the site's own fields…`).

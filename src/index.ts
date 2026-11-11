@@ -165,6 +165,8 @@ async function write(payload: Payload, o: Resolved, entry: AuditEntry, values?: 
     const r = own ? ({ ...(req ?? {}), payload, transactionID: own } as unknown as PayloadRequest) : req
     try {
       // Join the subject's chain: read its head, link to it, and move it only if nobody moved it meanwhile.
+      let moved: { head: Awaited<ReturnType<typeof readHead>>; hash: string } | null = null
+      try {
       for (let attempt = 0; attempt < 8; attempt++) {
         const head = await readHead(payload, o.heads, chainKey, r)
         const seq = (head?.seq ?? 0) + 1
@@ -173,12 +175,27 @@ async function write(payload: Payload, o: Resolved, entry: AuditEntry, values?: 
         const vh = hasValues ? valuesHash(values) : null
         const hash = entryHash({ ...base, chainKey, seq, prevHash, prevAt, extra, valuesHash: vh })
         if (!(await moveHead(payload, o.heads, chainKey, head, { hash, seq, at: base.at }, r))) continue
+        moved = { head, hash }
         const data = { ...base, ...(base.via ? {} : { via: undefined }), ...extra, chainKey, seq, prevHash, prevAt, hash, ...(hasValues ? { values, valuesHash: vh } : {}) }
-        await payload.create({ collection: o.slug as never, data: data as never, overrideAccess: true, ...(r ? { req: r } : {}) })
+        if (o.onWriteError === 'log') {
+          // A Payload operation that fails rolls back the whole transaction it's in, the change included, while
+          // this mode reports success. Written through the adapter instead, a failed entry can't undo the change.
+          await payload.db.create({ collection: o.slug, data: { ...data, at: new Date(data.at) }, ...(r ? { req: r } : {}) } as never)
+        } else await payload.create({ collection: o.slug as never, data: data as never, overrideAccess: true, ...(r ? { req: r } : {}) })
         if (own) await payload.db.commitTransaction(own)
         return
       }
       throw new Error(`audit-trail: the chain for ${chainKey} kept moving; the entry wasn’t written.`)
+      } catch (error) {
+        // With no transaction to roll back, put the head back, so it never points at an entry that wasn't written.
+        // Payload can leave a promise here that resolves to nothing when the database has no transactions.
+        const tx = r?.transactionID ? await Promise.resolve(r.transactionID).catch(() => null) : null
+        if (moved && !tx) {
+          if (moved.head) await payload.db.updateOne({ collection: o.heads, where: { and: [{ key: { equals: chainKey } }, { hash: { equals: moved.hash } }] } as never, data: { hash: moved.head.hash, seq: moved.head.seq, at: moved.head.at ?? null } } as never).catch(() => undefined)
+          else await payload.db.deleteMany({ collection: o.heads, where: { and: [{ key: { equals: chainKey } }, { hash: { equals: moved.hash } }] } as never }).catch(() => undefined)
+        }
+        throw error
+      }
     } catch (error) {
       if (own) await payload.db.rollbackTransaction(own).catch(() => undefined)
       throw error
@@ -220,7 +237,9 @@ const contextOf = (req: PayloadRequest): AuditContext | false => (req.context?.a
 export async function recordEvent(payload: Payload, entry: AuditEntry) {
   const o = optionsOf(payload)
   const base = entry.req ? await who(o, entry.req) : { actor: null, via: null }
-  await write(payload, o, { ...entry, actor: entry.actor !== undefined ? entry.actor : base.actor, via: entry.via !== undefined ? entry.via : base.via })
+  // The site's own fields (its tenant, say) come from its resolver too, unless the caller gave them.
+  const siteExtra = entry.req && o.extra ? await o.extra({ req: entry.req, collection: entry.subject.collection }) : {}
+  await write(payload, o, { ...entry, extra: { ...siteExtra, ...(entry.extra ?? {}) }, actor: entry.actor !== undefined ? entry.actor : base.actor, via: entry.via !== undefined ? entry.via : base.via })
 }
 
 /**

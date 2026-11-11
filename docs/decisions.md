@@ -22,3 +22,5 @@ Dated decisions for this repo, newest last.
 - D9, D10, D11, D13, D14, D15, D16: don't apply to this repo.
 
 - 2026-11-10 (Plugins Lead, K26): `adoptExistingEntries`, as Web Platform asked for the Captive Origins switch. One adoption seal in the seal chain covers every unhashed entry by content (not values), so pre-chain history is tamper-evident from the cutover on. Unhashed entries after it are breaks. Adoption is allowed after regular seals (the site's seal job may run before the script), but refused once the trail has been pruned. Built on branch `adopt-existing`, merging after its security read, so the owner's first publish (N99) includes it.
+
+- 2026-11-10 (K30 self-audit): in `onWriteError: 'log'` mode the entry is written through the database adapter, so a failed entry never undoes the change it records; `fail` mode keeps Payload's validation and undoes the change, as before.
