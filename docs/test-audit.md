@@ -187,3 +187,18 @@ Now 72 tests on main. Each new test below failed on ef35392 first, except two ke
 Mutation check of 2e8d82f, one guard at a time, in a separate copy of the repo: caught are the stored comparison, the restore's before-read, the beforeChange read, the password-from-hash rule, both halves of the `fromPluginEvent` rule, dropping `collection`, and (after adding the test above) the log line. Survivors, kept on purpose:
 - Searching the stack for this record's frame instead of taking the top one. Payload pops a nested write's frame before the outer write's `afterChange`, so the two agree unless a nested write fails partway on a database without transactions, which no test sets up.
 - Tying a reset to its account, and clearing reset state on sign-in. Each is covered by the other and by the stored-hash check, so removing one alone changes nothing a test can see.
+
+## 2026-11-11: concurrent writes on one request (re-read of 4fbe939)
+
+Now 77 tests on main.
+
+| Promise | Test |
+| --- | --- |
+| A hook fanning out updates of three accounts on one request records every change (two passwords, a hidden field), three rounds | "records every change when a hook fans out…" (failed on 4fbe939) |
+| An update whose before-reading is missing fails and is undone | "fails the change when it can't read what was stored before it…" (failed on 4fbe939) |
+| With `onWriteError: 'log'`, it goes through, is logged, and records what the copies show | log-mode: "when it can't read what was stored before a write…" |
+| A reset is tied to its own account | "ties a reset to its own account…" |
+| A reset's state is cleared once used | "records a reset once even when the same request signs in again…" |
+| Bulk and nested writes still pass | the tests above, unchanged |
+
+The two reset guards that survived the last mutation check were redundant with a third; one was removed (the sign-in clear), and the other two now each have a test that fails without them.

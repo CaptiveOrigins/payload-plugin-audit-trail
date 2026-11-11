@@ -64,7 +64,20 @@ const entries: CollectionConfig = {
     { name: 'mates', type: 'join', collection: 'studbook-entries', on: 'holder' } as never,
   ],
 }
-const plain: CollectionConfig = { slug: 'plain-notes', access: { read: () => true, create: () => true, update: () => true }, fields: [{ name: 'text', type: 'text' }] }
+const plain: CollectionConfig = {
+  slug: 'plain-notes',
+  access: { read: () => true, create: () => true, update: () => true },
+  fields: [{ name: 'text', type: 'text' }],
+  // A site hook that fans out several account updates at once, on the same request and transaction.
+  hooks: {
+    afterChange: [
+      async ({ req, context }) => {
+        const fan = context?.fanOut as { id: string; data: Record<string, unknown> }[] | undefined
+        if (fan) await Promise.all(fan.map((f) => req.payload.update({ collection: 'users', id: f.id, data: f.data as never, overrideAccess: true, req })))
+      },
+    ],
+  },
+}
 // During an autosave of an entry, a hook changes another audited record: that change must still be recorded.
 // A nested write inside a hook: saving one entry also sets another entry's hidden note, on the same request.
 entries.hooks = {
@@ -552,5 +565,59 @@ describe('per-write state (the site lead’s audit, PR #117)', () => {
     const token = await payload.forgotPassword({ collection: 'users', data: { email: 'reset-once@example.invalid' }, disableEmail: true })
     await payload.resetPassword({ collection: 'users', data: { token: String(token), password: 'Made-up-reset-once-2' }, overrideAccess: true })
     expect((await accountUpdates(id)).map((e) => e.changedFields)).toEqual([['password']])
+  })
+})
+
+describe('concurrent writes on one request (re-read of 4fbe939)', () => {
+  const account = async (email: string) => (await payload.create({ collection: 'users', data: { email, password: 'Made-up-fan-out-pass-0', tier: 'member' } as never })) as unknown as U
+
+  it('records every change when a hook fans out updates of three accounts at once', async () => {
+    for (let round = 0; round < 3; round++) {
+      const [a, b, c] = [await account(`fan-a${round}@example.invalid`), await account(`fan-b${round}@example.invalid`), await account(`fan-c${round}@example.invalid`)]
+      const fanOut = [
+        { id: a.id, data: { password: `Made-up-fan-out-pass-a${round}` } },
+        { id: b.id, data: { tier: 'admin' } },
+        { id: c.id, data: { password: `Made-up-fan-out-pass-c${round}`, name: 'C' } },
+      ]
+      await payload.create({ collection: 'plain-notes', data: { text: 'fan out' } as never, overrideAccess: true, context: { fanOut } })
+      expect((await accountUpdates(a.id)).map((e) => e.changedFields)).toEqual([['password']])
+      expect((await accountUpdates(b.id)).map((e) => e.changedFields)).toEqual([['tier']])
+      expect((await accountUpdates(c.id)).map((e) => e.changedFields)).toEqual([['name', 'password']])
+    }
+    expect(await verifyAuditTrail(payload)).toMatchObject({ ok: true })
+  })
+
+  it('fails the change when it can’t read what was stored before it, instead of trusting the saved copies', async () => {
+    const u = await account('no-before@example.invalid')
+    const real = payload.db.findOne.bind(payload.db)
+    let hidden = 0
+    const spy = vi.spyOn(payload.db, 'findOne').mockImplementation(((args: { collection: string; select?: Record<string, unknown> }) => (args.collection === 'users' && args.select?.hash && hidden++ === 0 ? Promise.resolve(null) : real(args as never))) as never)
+    await expect(payload.update({ collection: 'users', id: u.id, data: { name: 'Changed' } as never, overrideAccess: true })).rejects.toThrow(/before the write/)
+    spy.mockRestore()
+    expect(hidden).toBeGreaterThan(0)
+    expect(((await payload.findByID({ collection: 'users', id: u.id, overrideAccess: true })) as unknown as { name?: string }).name ?? null).toBeNull()
+    expect((await accountUpdates(u.id)).length).toBe(0)
+  })
+
+  it('ties a reset to its own account: after a reset that fails part-way, another account’s sign-in on the same request records nothing', async () => {
+    const a = await account('reset-a@example.invalid')
+    const b = await account('reset-b@example.invalid')
+    const token = await payload.forgotPassword({ collection: 'users', data: { email: 'reset-a@example.invalid' }, disableEmail: true })
+    const { req } = await as(null)
+    const real = payload.db.updateOne.bind(payload.db)
+    const spy = vi.spyOn(payload.db, 'updateOne').mockImplementation(((args: { collection: string }) => (args.collection === 'users' ? Promise.reject(new Error('made-up outage')) : real(args as never))) as never)
+    await expect(payload.resetPassword({ collection: 'users', data: { token: String(token), password: 'Made-up-fan-out-pass-9' }, overrideAccess: true, req })).rejects.toThrow()
+    spy.mockRestore()
+    await payload.login({ collection: 'users', data: { email: 'reset-b@example.invalid', password: 'Made-up-fan-out-pass-0' }, req })
+    expect((await accountUpdates(a.id)).length + (await accountUpdates(b.id)).length).toBe(0)
+  })
+
+  it('records a reset once even when the same request signs in again afterwards', async () => {
+    const a = await account('reset-again@example.invalid')
+    const token = await payload.forgotPassword({ collection: 'users', data: { email: 'reset-again@example.invalid' }, disableEmail: true })
+    const { req } = await as(null)
+    await payload.resetPassword({ collection: 'users', data: { token: String(token), password: 'Made-up-fan-out-pass-8' }, overrideAccess: true, req })
+    await payload.login({ collection: 'users', data: { email: 'reset-again@example.invalid', password: 'Made-up-fan-out-pass-8' }, req })
+    expect((await accountUpdates(a.id)).map((e) => e.changedFields)).toEqual([['password']])
   })
 })

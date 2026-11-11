@@ -16,7 +16,7 @@ const make = async (name: string, transactions: boolean) =>
       telemetry: false,
       typescript: { autoGenerate: false },
       db: mongooseAdapter({ url: mongo.getUri(name), ensureIndexes: true, ...(transactions ? {} : { transactionOptions: false }) }),
-      collections: [{ slug: 'users', auth: true, fields: [] }, { slug: 'notes', access: { read: () => true }, fields: [{ name: 'text', type: 'text' }] }],
+      collections: [{ slug: 'users', auth: true, fields: [] }, { slug: 'notes', access: { read: () => true }, fields: [{ name: 'text', type: 'text' }, { name: 'quiet', type: 'text', hidden: true }] }],
       plugins: [
         auditTrail({
           collections: ['notes'],
@@ -92,6 +92,23 @@ describe("onWriteError: 'log'", () => {
     expect((await entries(p))[0]!.tenant).toBe('t1')
     await recordEvent(p, { action: 'exported', subject: { collection: 'notes', id: 'n2' }, extra: { tenant: 't2' }, req: { payload: p, context: { tenant: 't1' } } as never })
     expect((await entries(p)).find((e) => e.subjectId === 'n2')!.tenant).toBe('t2') // the caller's own value wins
+    await p.destroy()
+  })
+
+  it('when it can’t read what was stored before a write, keeps the change, says so in the log, and records what the copies show', async () => {
+    const p = await make('lognobefore', true)
+    const note = (await p.create({ collection: 'notes' as never, data: { text: 'first' } as never, overrideAccess: true, context: { tenant: 't1' } })) as Doc
+    const real = p.db.findOne.bind(p.db)
+    let hidden = 0
+    const spy = vi.spyOn(p.db, 'findOne').mockImplementation(((args: { collection: string; select?: Record<string, unknown> }) => (args.collection === 'notes' && args.select?.quiet && hidden++ === 0 ? Promise.resolve(null) : real(args as never))) as never)
+    const logged: string[] = []
+    const log = vi.spyOn(p.logger, 'error').mockImplementation(((...args: unknown[]) => void logged.push(JSON.stringify(args))) as never)
+    await p.update({ collection: 'notes' as never, id: note.id, data: { text: 'second' } as never, overrideAccess: true, context: { tenant: 't1' } })
+    spy.mockRestore()
+    log.mockRestore()
+    expect(((await p.findByID({ collection: 'notes' as never, id: note.id, overrideAccess: true })) as Doc).text).toBe('second')
+    expect(logged.join('\n')).toContain('saved copies only')
+    expect((await entries(p)).find((e) => e.action === 'update')!.changedFields).toEqual(['text'])
     await p.destroy()
   })
 

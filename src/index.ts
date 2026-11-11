@@ -4,7 +4,6 @@ import type {
   CollectionAfterDeleteHook,
   CollectionAfterLoginHook,
   CollectionBeforeChangeHook,
-  CollectionBeforeValidateHook,
   CollectionAfterOperationHook,
   CollectionBeforeOperationHook,
   CollectionConfig,
@@ -254,26 +253,33 @@ function skipped(req: PayloadRequest, name: 'auditTrailAutosave' | 'auditTrailRe
 
 /**
  * Per-write state, kept off `req.context` (a caller's context object can be shared by concurrent writes): for each
- * request and collection, a stack with one frame per operation, holding the before-write digests by record id. A
- * nested write pushes its own frame, so it can't replace the outer one's.
+ * request, the before-write digests by `collection:id`. Each write to a record adds its own reading and takes its
+ * own back, newest first, so writes to different records at once never touch each other's, and a nested write to
+ * the same record leaves the outer one's in place.
  */
-type Frame = { args: unknown; before: Map<string, Record<string, string>> }
-const frames = new WeakMap<object, Map<string, Frame[]>>()
-function stackOf(req: PayloadRequest, slug: string): Frame[] {
-  let bySlug = frames.get(req)
-  if (!bySlug) frames.set(req, (bySlug = new Map()))
-  let stack = bySlug.get(slug)
-  if (!stack) bySlug.set(slug, (stack = []))
-  return stack
+const befores = new WeakMap<object, Map<string, Record<string, string>[]>>()
+function keepBefore(req: PayloadRequest, key: string, digests: Record<string, string>) {
+  let byRecord = befores.get(req)
+  if (!byRecord) befores.set(req, (byRecord = new Map()))
+  const list = byRecord.get(key)
+  if (list) list.push(digests)
+  else byRecord.set(key, [digests])
 }
-/** A password reset in progress, per request, tied to its account once Payload has found it. */
-const resets = new WeakMap<object, { slug: string; id?: string; before?: Record<string, string> }>()
+function takeBefore(req: PayloadRequest, key: string): Record<string, string> | undefined {
+  const list = befores.get(req)?.get(key)
+  const taken = list?.pop()
+  if (list && !list.length) befores.get(req)?.delete(key)
+  return taken
+}
+/** A password reset in progress, per request: the account its link belongs to, and its stored hash and salt (digests) before it. */
+const resets = new WeakMap<object, { id: string; before: Record<string, string> }>()
 
-/** Digests of the named fields as the database holds them now, read inside the request's transaction. */
-async function storedDigests(payload: Payload, slug: string, id: unknown, names: string[], req: PayloadRequest): Promise<Record<string, string> | undefined> {
-  const row = (await payload.db.findOne({ collection: slug, where: { id: { equals: id } }, req } as never)) as Record<string, unknown> | null
-  return row ? Object.fromEntries(names.map((n) => [n, fingerprint(row[n])])) : undefined
+/** Digests of the named fields as the database holds them now, read inside the request's transaction. Only those fields are read. */
+async function storedDigests(payload: Payload, slug: string, where: Record<string, unknown>, names: string[], req: PayloadRequest): Promise<{ id: unknown; digests: Record<string, string> } | undefined> {
+  const row = (await payload.db.findOne({ collection: slug, where, req, select: Object.fromEntries(names.map((n) => [n, true])) } as never)) as Record<string, unknown> | null
+  return row ? { id: row.id, digests: Object.fromEntries(names.map((n) => [n, fingerprint(row[n])])) } : undefined
 }
+const byId = (id: unknown) => ({ id: { equals: id } })
 
 /** Top-level fields the saved copy may leave out because they aren't read back: hidden, or with their own read access. From the built config, so fields other plugins add count too. */
 const unreadableCache = new WeakMap<object, Set<string>>()
@@ -764,11 +770,14 @@ export const auditTrail =
           const autosaves = Boolean(collection.versions && typeof collection.versions === 'object' && collection.versions.drafts && typeof collection.versions.drafts === 'object' && collection.versions.drafts.autosave)
           const beforeOperation: CollectionBeforeOperationHook = async ({ args, operation, req }) => {
             const a = args as { autosave?: boolean; draft?: boolean; id?: string | number }
-            // A password reset writes straight to the database, so no change hook sees it: beforeValidate and afterLogin,
-            // inside its transaction, compare the stored hash. A new sign-in drops anything a failed reset left behind.
-            if (operation === 'resetPassword') resets.set(req, { slug: collection.slug })
-            if (operation === 'login') resets.delete(req)
-            if (operation === 'create' || operation === 'update' || operation === 'restoreVersion') stackOf(req, collection.slug).push({ args, before: new Map() })
+            // A password reset writes straight to the database, so no change hook sees it. Its account is found here
+            // by its link, inside the reset's transaction, and afterLogin (still inside it) compares the stored hash.
+            if (operation === 'resetPassword') {
+              const token = (args as { data?: { token?: unknown } }).data?.token
+              const found = typeof token === 'string' && token ? await storedDigests(req.payload, collection.slug, { resetPasswordToken: { equals: token } }, ['hash', 'salt'], req) : undefined
+              if (found) resets.set(req, { id: String(found.id), before: found.digests })
+              else resets.delete(req)
+            }
             if (operation === 'update' && a.id !== undefined) {
               const key = `${collection.slug}:${String(a.id)}`
               // Only a real draft autosave: the collection autosaves drafts, it's a draft, and it's this record.
@@ -782,8 +791,8 @@ export const auditTrail =
                 (skipped(req, 'auditTrailRestore') as Map<string, string>).set(`${collection.slug}:${String(parent)}`, String(a.id))
                 // Restoring hands beforeChange a copy of req, so what's stored before is read here, inside the transaction.
                 const names = watched(req.payload)
-                const before = names.length ? await storedDigests(req.payload, collection.slug, parent, names, req) : undefined
-                if (before) stackOf(req, collection.slug).at(-1)?.before.set(String(parent), before)
+                const before = names.length ? await storedDigests(req.payload, collection.slug, byId(parent), names, req) : undefined
+                if (before) keepBefore(req, `${collection.slug}:${String(parent)}`, before.digests)
               }
             }
             return args
@@ -791,43 +800,37 @@ export const auditTrail =
           // What the database holds before the write, after any site hook ran, by digest: an update's hidden fields and hash.
           const beforeChange: CollectionBeforeChangeHook = async ({ data, operation, originalDoc, req }) => {
             const names = watched(req.payload)
-            const frame = frames.get(req)?.get(collection.slug)?.at(-1)
-            if (operation === 'update' && frame && names.length && originalDoc?.id !== undefined && contextOf(req) !== false && !frame.before.has(String(originalDoc.id))) {
-              const before = await storedDigests(req.payload, collection.slug, originalDoc.id, names, req)
-              if (before) frame.before.set(String(originalDoc.id), before)
+            if (operation === 'update' && names.length && originalDoc?.id !== undefined && contextOf(req) !== false) {
+              const before = await storedDigests(req.payload, collection.slug, byId(originalDoc.id), names, req)
+              if (before) keepBefore(req, `${collection.slug}:${String(originalDoc.id)}`, before.digests)
             }
             return data
           }
           const afterChange: CollectionAfterChangeHook = async ({ doc, operation, previousDoc, req }) => {
             const names = watched(req.payload)
-            let stored: Stored | undefined
+            let digests: Stored | undefined
             if (names.length && contextOf(req) !== false) {
-              // This write's own frame: the newest one holding this record.
-              const frame = [...(frames.get(req)?.get(collection.slug) ?? [])].reverse().find((f) => f.before.has(String(doc.id)))
-              const before = frame?.before.get(String(doc.id))
-              frame?.before.delete(String(doc.id))
-              const after = await storedDigests(req.payload, collection.slug, doc.id, names, req)
-              // An update with no reading from before can't say what the database changed: fall back to the copies.
-              if (after && (operation === 'create' || before)) stored = { before, after }
+              const before = operation === 'update' ? takeBefore(req, `${collection.slug}:${String(doc.id)}`) : undefined
+              const after = (await storedDigests(req.payload, collection.slug, byId(doc.id), names, req))?.digests
+              if (after && (operation === 'create' || before)) digests = { before, after }
+              else {
+                // Without both readings the saved copies can't show a new hash or a hidden field, so this isn't guessed.
+                // As with an entry that can't be written (ADR 0001, decision 3): the change fails, unless the site chose 'log'.
+                const error = new Error(`audit-trail: couldn't read what ${collection.slug} ${String(doc.id)} held ${after ? 'before the write' : 'after the write'}, so its hidden fields and password can't be compared.`)
+                if (o.onWriteError !== 'log') throw error
+                req.payload.logger.error({ msg: `audit-trail: ${collection.slug} ${String(doc.id)} was recorded from its saved copies only (onWriteError: log); a change to a hidden field or password may be missing.` })
+              }
             }
-            await record(operation, collection.slug, doc, previousDoc, req, skip, stored)
+            await record(operation, collection.slug, doc, previousDoc, req, skip, digests)
             return doc
-          }
-          const beforeValidate: CollectionBeforeValidateHook = async ({ data, operation, req }) => {
-            const reset = resets.get(req)
-            const id = (data as { id?: unknown } | undefined)?.id
-            if (reset && reset.slug === collection.slug && !reset.id && operation === 'update' && id !== undefined && id !== null) {
-              reset.id = String(id)
-              reset.before = await storedDigests(req.payload, collection.slug, id, ['hash', 'salt'], req)
-            }
-            return data
           }
           const afterLogin: CollectionAfterLoginHook = async ({ req, user }) => {
             const reset = resets.get(req)
+            if (!reset) return
             resets.delete(req)
             const id = (user as { id?: unknown }).id
-            if (!reset?.before || reset.slug !== collection.slug || reset.id !== String(id)) return
-            const after = await storedDigests(req.payload, collection.slug, id, ['hash', 'salt'], req)
+            if (reset.id !== String(id)) return
+            const after = (await storedDigests(req.payload, collection.slug, byId(id), ['hash', 'salt'], req))?.digests
             if (!after) return
             // The same copy on both sides, so only the password can be listed, and only if the stored hash moved. The account that held the link is the actor.
             const doc = user as unknown as Record<string, unknown>
@@ -838,13 +841,8 @@ export const auditTrail =
             return doc
           }
           const afterOperation: CollectionAfterOperationHook = ({ args, operation, req, result }) => {
-            // Drop this operation's frame, and any left above it by a nested write that failed.
-            const stack = frames.get(req)?.get(collection.slug)
-            const at = stack ? stack.findIndex((f) => f.args === args) : -1
-            if (stack && at >= 0) stack.splice(at)
             const id = (args as { id?: string | number }).id
             if ((operation === 'update' || operation === 'updateByID') && id !== undefined) skipped(req, 'auditTrailAutosave').delete(`${collection.slug}:${String(id)}`)
-            if (operation === 'resetPassword') resets.delete(req)
             if (operation === 'restoreVersion') {
               const parent = (result as { id?: unknown } | undefined)?.id
               if (parent !== undefined) (skipped(req, 'auditTrailRestore') as Map<string, string>).delete(`${collection.slug}:${String(parent)}`)
@@ -860,7 +858,7 @@ export const auditTrail =
               afterChange: [...(collection.hooks?.afterChange ?? []), afterChange],
               afterDelete: [...(collection.hooks?.afterDelete ?? []), afterDelete],
               afterOperation: [...(collection.hooks?.afterOperation ?? []), afterOperation],
-              ...(collection.auth ? { beforeValidate: [...(collection.hooks?.beforeValidate ?? []), beforeValidate], afterLogin: [...(collection.hooks?.afterLogin ?? []), afterLogin] } : {}),
+              ...(collection.auth ? { afterLogin: [...(collection.hooks?.afterLogin ?? []), afterLogin] } : {}),
             },
           }
         }),

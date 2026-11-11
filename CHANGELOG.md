@@ -4,6 +4,7 @@
 
 - Setting a password (create, update, or a reset by emailed link) records `password` by name, when the stored hash or salt changed. They're never listed, so it used to leave no entry. Found by the Captive Origins site (K428); its tests are ported.
 - A hidden or read-restricted field no longer shows as changed on every update. It's compared as stored, read inside the write's transaction before and after, so a change made by a site hook or a restore is still recorded and an unchanged one isn't. Only digests are kept, in memory, per request and per write (a stack, so nested and concurrent writes don't mix), never in `req.context`.
+- Several writes at once on one request (a hook fanning out updates) each keep their own reading, keyed by record. An update whose earlier reading is missing fails, or with `onWriteError: 'log'` is logged and recorded from the saved copies; it's never guessed quietly.
 - An auth collection's create no longer lists `collection`.
 - `onWriteError: 'log'` logs the error's name, not its message.
 - `fromPluginEvent` finds Payload when an event has no `req`: from the event's `payload`, a `{ payload }` binding, or the one Payload the plugin started on (it refuses to guess between several). MFA's `start(payload, { userId })` raises such an event.
