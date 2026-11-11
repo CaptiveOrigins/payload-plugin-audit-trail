@@ -146,3 +146,4 @@ Gaps added: thirteen tests in all; the last two after the second read (b104d3b);
 - `onWriteError: 'log'` with transactions: a change whose entry would fail validation is kept, and its entry written (`log-mode > with transactions…`).
 - `onWriteError: 'log'` without transactions: the head is put back when an entry fails, and verify stays green; the chain carries on (`log-mode > without transactions…`). The check awaits `req.transactionID`, which Payload can leave as a promise of nothing.
 - `recordEvent` fills the site's own fields from `extra`, and the caller's own values win (`log-mode > fills the site's own fields…`).
+- With transactions too, a failed entry in 'log' mode puts the head back inside the transaction (`log-mode > with transactions, also puts the head back…`), found by the security read of 77186de.

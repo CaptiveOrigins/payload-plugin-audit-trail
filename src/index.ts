@@ -190,9 +190,11 @@ async function write(payload: Payload, o: Resolved, entry: AuditEntry, values?: 
         // With no transaction to roll back, put the head back, so it never points at an entry that wasn't written.
         // Payload can leave a promise here that resolves to nothing when the database has no transactions.
         const tx = r?.transactionID ? await Promise.resolve(r.transactionID).catch(() => null) : null
-        if (moved && !tx) {
-          if (moved.head) await payload.db.updateOne({ collection: o.heads, where: { and: [{ key: { equals: chainKey } }, { hash: { equals: moved.hash } }] } as never, data: { hash: moved.head.hash, seq: moved.head.seq, at: moved.head.at ?? null } } as never).catch(() => undefined)
-          else await payload.db.deleteMany({ collection: o.heads, where: { and: [{ key: { equals: chainKey } }, { hash: { equals: moved.hash } }] } as never }).catch(() => undefined)
+        // In 'log' mode the caller's transaction commits anyway, so the head goes back inside it too.
+        if (moved && (!tx || o.onWriteError === 'log')) {
+          const inTx = tx ? { req: r } : {}
+          if (moved.head) await payload.db.updateOne({ collection: o.heads, where: { and: [{ key: { equals: chainKey } }, { hash: { equals: moved.hash } }] } as never, data: { hash: moved.head.hash, seq: moved.head.seq, at: moved.head.at ?? null }, ...inTx } as never).catch(() => undefined)
+          else await payload.db.deleteMany({ collection: o.heads, where: { and: [{ key: { equals: chainKey } }, { hash: { equals: moved.hash } }] } as never, ...inTx } as never).catch(() => undefined)
         }
         throw error
       }

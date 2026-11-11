@@ -67,6 +67,20 @@ describe("onWriteError: 'log'", () => {
     await p.destroy()
   })
 
+  it('with transactions, also puts the head back when an entry fails, so the chain stays whole', async () => {
+    const p = await make('logtx2', true)
+    const note = (await p.create({ collection: 'notes' as never, data: { text: 'first' } as never, overrideAccess: true })) as Doc
+    const orig = p.db.create.bind(p.db)
+    const spy = vi.spyOn(p.db, 'create').mockImplementation(((args: { collection: string }) => (args.collection === 'audit-events' ? Promise.reject(new Error('made-up outage')) : orig(args as never))) as never)
+    await p.update({ collection: 'notes' as never, id: note.id, data: { text: 'second' } as never, overrideAccess: true })
+    spy.mockRestore()
+    expect(((await p.findByID({ collection: 'notes' as never, id: note.id, overrideAccess: true })) as Doc).text).toBe('second')
+    expect((await verifyAuditTrail(p)).firstBreak?.reason ?? null).toBeNull()
+    await p.update({ collection: 'notes' as never, id: note.id, data: { text: 'third' } as never, overrideAccess: true })
+    expect((await verifyAuditTrail(p)).firstBreak?.reason ?? null).toBeNull()
+    await p.destroy()
+  })
+
   it('fills the site’s own fields on events from other plugins, from its resolver', async () => {
     const p = await make('logextra', true)
     await recordEvent(p, { action: 'exported', subject: { collection: 'notes', id: 'n1' }, req: { payload: p, context: { tenant: 't1' } } as never })

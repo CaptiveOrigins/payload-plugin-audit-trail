@@ -2,7 +2,7 @@
 
 A tamper-evident audit trail for Payload: who changed which fields of which record, from where and through whom, never the values. Each record's entries are hash-chained, a seal chains them across the site, and a verify reports the first break.
 
-**Status:** early, 0.1.0, not on npm yet. 55 tests pass against a real Payload 3.92 with an in-memory MongoDB (a replica set). They cover what's recorded, failing closed with and without transactions, the value log and its startup refusals, read access, drafts, autosave and restores, the sink for other plugins, retention, and the chain: 40 changes at once without a fork, two seals at once, and tampering caught each way (an entry edited, the newest deleted, one removed or forged, a whole record's chain deleted after a seal, values edited, the first entry after a prune deleted), and adopting a log kept before the plugin (verify after it, each kind of tampering with adopted entries, entries written around the plugin, running it twice, and pruning). It isn't in use on any site yet.
+**Status:** early, 0.1.0, not on npm yet. 56 tests pass against a real Payload 3.92 with an in-memory MongoDB (a replica set). They cover what's recorded, failing closed with and without transactions, the value log and its startup refusals, read access, drafts, autosave and restores, the sink for other plugins, retention, and the chain: 40 changes at once without a fork, two seals at once, and tampering caught each way (an entry edited, the newest deleted, one removed or forged, a whole record's chain deleted after a seal, values edited, the first entry after a prune deleted), and adopting a log kept before the plugin (verify after it, each kind of tampering with adopted entries, entries written around the plugin, running it twice, and pruning). It isn't in use on any site yet.
 
 ## What it does
 
@@ -10,6 +10,7 @@ A tamper-evident audit trail for Payload: who changed which fields of which reco
   - An update that changes nothing records nothing. Sign-in internals, timestamps and join fields are never listed.
   - `context: { audit: false }` skips bookkeeping writes. `context: { audit: { origin, system, run, reason } }` describes automated work. `reason` is free text you write: never put values in it.
 - **In the same transaction as the change.** If the entry can't be written, the change fails. That needs transactions, so without a replica set the plugin refuses to start unless you set `onWriteError: 'log'`.
+- **With `onWriteError: 'log'`**, a failed entry is logged and the change goes through, with the chain left as it was. A database error inside the transaction itself (a write conflict, say) can still abort the transaction, change included, as any write in it would.
 - **Tamper-evident.**
   - Each entry carries the hash of the entry before it for the same record, and a head per record says which entry is newest.
   - `sealAuditTrail(payload)`, run from your job every `sealEveryHours` (default 24; hourly suits a busy site), chains every entry since the last seal into one digest.
