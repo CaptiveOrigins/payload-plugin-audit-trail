@@ -161,6 +161,27 @@ describe('adopting entries from before chaining', () => {
     expect((await verifyAuditTrail(payload)).firstBreak?.reason).toMatch(/still here after the cut/)
   })
 
+  it('still seals a hashed entry dated before the newest old entry (the old logger ran briefly after the switch)', async () => {
+    await write('chained, first')
+    const [hashed] = (await payload.find({ collection: 'audit-events' as never, limit: 1, depth: 0, overrideAccess: true, showHiddenFields: true })).docs as Doc[]
+    await raw()['audit-events']!.collection.insertMany([{ at: new Date(Date.now() + 1000), action: 'update', subjectCollection: 'notes', subjectId: 'old-logger', origin: 'web' }])
+    await adoptExistingEntries(payload)
+    const later = new Date(Date.now() + DAY)
+    await sealAuditTrail(payload, { now: later })
+    expect(await verifyAuditTrail(payload, { now: later })).toMatchObject({ ok: true })
+    // Deleting the hashed entry and its head must now be caught by the seal.
+    await raw()['audit-events']!.collection.deleteOne({ hash: hashed!.hash })
+    await raw()['audit-events-heads']!.collection.deleteMany({ key: hashed!.chainKey })
+    expect((await verifyAuditTrail(payload, { now: later })).ok).toBe(false)
+  })
+
+  it('treats an empty hash as unhashed, both when adopting and in verify', async () => {
+    await raw()['audit-events']!.collection.insertMany([{ at: new Date(Date.now() - DAY), action: 'update', subjectCollection: 'notes', subjectId: 'empty-hash', origin: 'web', hash: '' }])
+    expect((await verifyAuditTrail(payload)).ok).toBe(false)
+    expect((await adoptExistingEntries(payload)).adopted).toBe(1)
+    expect(await verifyAuditTrail(payload)).toMatchObject({ ok: true })
+  })
+
   it('keeps unhashed entries out of a regular seal, and keeps adopted entries through a prune that cuts inside them', async () => {
     await oldEntries(4, 400)
     // A seal that ends between the old entries, made before adoption (the site's seal job ran first).

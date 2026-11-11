@@ -57,7 +57,8 @@ If the collection already holds entries written before this plugin, they have no
 - It writes an "adoption" seal into the seal chain. The seal's digest covers every unhashed entry up to the newest of them, by its content. Logged values get their own hash first, and the digest covers that hash: clearing values by age still works, editing them doesn't.
 - From then on, verify checks those entries against the digest. Editing, deleting or adding one within that range is a break. An unhashed entry dated after the adoption is a break too, because something wrote around the plugin.
 - Running it again does nothing. It refuses if unhashed entries appeared after the adoption, or once the trail has been pruned at all (before or after an adoption), because then they can only be a break. It reads and writes inside the seal's own transaction, so a seal or prune at the same moment can't slip in between.
-- Your seal job may run before the script: regular seals skip unhashed entries, and each seal continues from the newest end of any seal.
+- Your seal job may run before the script: regular seals skip unhashed entries, and each seal continues from the newest end of any regular seal or checkpoint.
+- The whole old log is adopted in one database transaction. MongoDB ends transactions after 60 seconds by default, so a very large log may need that raised for the run.
 - Pruning keeps adopted entries until a cut passes all of them, then removes them with the adoption seal, and the checkpoint records the cut.
 - What the old entries said before the adoption can't be proven: the seal makes them tamper-evident only from the moment it's written. Copy its digest out with `onSeal`, as with any seal.
 

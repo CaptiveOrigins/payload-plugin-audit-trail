@@ -46,4 +46,7 @@ Gaps, skipped with reason: Postgres (not supported in 0.1, said in Limits); a ve
 | A hashed entry's values hash is covered by its own hash | `adopt > a hashed entry's values hash…` |
 | An adoption seal left behind after a prune past it still makes leftover unhashed entries a break | `adopt > still checks unhashed entries…` |
 
-Gaps added: eleven tests in all; the last four after the security read of 0d94668 found the seal-continuation blocker, the values gap and the untested leftover check. A mutation check catches every guard but one: leaving the values hash out of the adoption digest survives, because verify's own values check on unhashed entries already catches the same edits. Gaps skipped: an adoption racing a prune isn't tested directly (its reads moved into the seal's transaction, whose head move decides the race, as for seals).
+| A hashed entry dated before the newest old entry is still sealed | `adopt > still seals a hashed entry…` |
+| An empty hash counts as unhashed in adoption and verify | `adopt > treats an empty hash…` |
+
+Gaps added: thirteen tests in all; the last two after the second read (b104d3b); the last four after the security read of 0d94668 found the seal-continuation blocker, the values gap and the untested leftover check. A mutation check catches every guard but one: leaving the values hash out of the adoption digest survives, because verify's own values check on unhashed entries already catches the same edits. Gaps skipped: an adoption racing a prune isn't tested directly (its reads moved into the seal's transaction, whose head move decides the race, as for seals).

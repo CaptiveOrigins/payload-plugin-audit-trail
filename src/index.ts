@@ -297,13 +297,14 @@ export async function sealAuditTrail(payload: Payload, args: { now?: Date; upTo?
   if (args.upTo && args.upTo.getTime() > latest.getTime()) throw new Error(`audit-trail: a seal can't reach closer than ${o.sealGraceMinutes} minutes to now (transactions may still be open).`)
   const upTo = (args.upTo ?? latest).toISOString()
   return writeSeal(payload, o, async (last) => {
-    // Continue from the newest end of any seal, not just the last one written: an adoption or a checkpoint can end
-    // earlier than a seal before it, and starting there would seal the same entries twice.
-    const newest = (await allSorted(payload, o.seals, {}, ['-upTo']))[0] as Seal | undefined
+    // Continue from the newest end of any seal or checkpoint, not just the last one written: a checkpoint can end
+    // earlier than a seal before it, and starting there would seal the same entries twice. The adoption is left
+    // out: it covers only unhashed entries, so a hashed entry dated before its end still needs a regular seal.
+    const newest = (await allSorted(payload, o.seals, { kind: { in: ['seal', 'checkpoint'] } }, ['-upTo']))[0] as Seal | undefined
     const from = newest ? new Date(newest.upTo).toISOString() : null
-    if ((from && from >= upTo) || (last && new Date(last.upTo).toISOString() >= upTo)) return null
+    if ((from && from >= upTo) || (last && last.kind !== 'adoption' && new Date(last.upTo).toISOString() >= upTo)) return null
     // Entries from before chaining have no hash: the adoption seal covers them, never a regular one.
-    const entries = await allSorted(payload, o.slug, { and: [{ at: { less_than_equal: upTo } }, { hash: { exists: true } }, ...(from ? [{ at: { greater_than: from } }] : [])] })
+    const entries = await allSorted(payload, o.slug, { and: [{ at: { less_than_equal: upTo } }, { hash: { exists: true } }, { hash: { not_equals: '' } }, ...(from ? [{ at: { greater_than: from } }] : [])] })
     return { kind: 'seal', fromAt: from, upTo, count: entries.length, digest: sealDigest(last?.digest ?? null, entries.map((e) => String(e.hash)), upTo) }
   })
 }
