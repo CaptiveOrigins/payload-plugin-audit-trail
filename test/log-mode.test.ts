@@ -67,13 +67,18 @@ describe("onWriteError: 'log'", () => {
     await p.destroy()
   })
 
-  it('with transactions, also puts the head back when an entry fails, so the chain stays whole', async () => {
+  it('with transactions, also puts the head back when an entry fails, so the chain stays whole; it logs the error’s name, never its message', async () => {
     const p = await make('logtx2', true)
     const note = (await p.create({ collection: 'notes' as never, data: { text: 'first' } as never, overrideAccess: true })) as Doc
     const orig = p.db.create.bind(p.db)
-    const spy = vi.spyOn(p.db, 'create').mockImplementation(((args: { collection: string }) => (args.collection === 'audit-events' ? Promise.reject(new Error('made-up outage')) : orig(args as never))) as never)
+    const spy = vi.spyOn(p.db, 'create').mockImplementation(((args: { collection: string }) => (args.collection === 'audit-events' ? Promise.reject(new RangeError('made-up outage with private details')) : orig(args as never))) as never)
+    const logged: string[] = []
+    const log = vi.spyOn(p.logger, 'error').mockImplementation(((...args: unknown[]) => void logged.push(JSON.stringify(args))) as never)
     await p.update({ collection: 'notes' as never, id: note.id, data: { text: 'second' } as never, overrideAccess: true })
     spy.mockRestore()
+    log.mockRestore()
+    expect(logged.join('\n')).toContain('RangeError')
+    expect(logged.join('\n')).not.toContain('private details')
     expect(((await p.findByID({ collection: 'notes' as never, id: note.id, overrideAccess: true })) as Doc).text).toBe('second')
     expect((await verifyAuditTrail(p)).firstBreak?.reason ?? null).toBeNull()
     await p.update({ collection: 'notes' as never, id: note.id, data: { text: 'third' } as never, overrideAccess: true })

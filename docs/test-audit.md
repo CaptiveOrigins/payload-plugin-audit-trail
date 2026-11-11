@@ -182,3 +182,8 @@ Now 72 tests on main. Each new test below failed on ef35392 first, except two ke
 | Concurrent creates and updates sharing one context object each record their own fields | "two concurrent writes sharing one context object…" |
 | A nested write in a hook doesn't clobber the outer one (guard: passed on ef35392, whose keys were per record) | "a nested write inside a hook…" |
 | Without a `req`, mapper errors and unknown actions still throw; only a failed write logs its name and returns | "without a request, a failed write logs…" |
+| `onWriteError: 'log'` logs the error's name, never its message | log-mode: "with transactions, also puts the head back… it logs the error's name, never its message" (failed on 2e8d82f's parent first) |
+
+Mutation check of 2e8d82f, one guard at a time, in a separate copy of the repo: caught are the stored comparison, the restore's before-read, the beforeChange read, the password-from-hash rule, both halves of the `fromPluginEvent` rule, dropping `collection`, and (after adding the test above) the log line. Survivors, kept on purpose:
+- Searching the stack for this record's frame instead of taking the top one. Payload pops a nested write's frame before the outer write's `afterChange`, so the two agree unless a nested write fails partway on a database without transactions, which no test sets up.
+- Tying a reset to its account, and clearing reset state on sign-in. Each is covered by the other and by the stored-hash check, so removing one alone changes nothing a test can see.
