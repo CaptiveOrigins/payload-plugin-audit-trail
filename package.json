@@ -1,5 +1,5 @@
 {
-  "name": "@captiveorigins/payload-plugin-audit-trail",
+  "name": "@extantape/payload-plugin-audit-trail",
   "version": "0.1.0",
   "description": "Tamper-evident audit trail for Payload: who changed which fields, from where and through whom, never the values, hash-chained per record and sealed across the site, with a verify that reports any break; an opt-in old-value log and a sink for other plugins.",
   "keywords": [
@@ -16,13 +16,13 @@
     "provenance"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/CaptiveOrigins/payload-plugin-audit-trail#readme",
+  "homepage": "https://github.com/ExtantApe/payload-plugin-audit-trail#readme",
   "bugs": {
-    "url": "https://github.com/CaptiveOrigins/payload-plugin-audit-trail/issues"
+    "url": "https://github.com/ExtantApe/payload-plugin-audit-trail/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CaptiveOrigins/payload-plugin-audit-trail.git"
+    "url": "git+https://github.com/ExtantApe/payload-plugin-audit-trail.git"
   },
   "type": "module",
   "exports": {

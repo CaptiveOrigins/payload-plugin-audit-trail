@@ -48,11 +48,11 @@ The plugin imports none of them. The site connects them in its own config.
 ## Install
 
 ```bash
-npm install @captiveorigins/payload-plugin-audit-trail
+npm install @extantape/payload-plugin-audit-trail
 ```
 
 ```ts
-import { auditTrail } from '@captiveorigins/payload-plugin-audit-trail'
+import { auditTrail } from '@extantape/payload-plugin-audit-trail'
 
 export default buildConfig({
   plugins: [
