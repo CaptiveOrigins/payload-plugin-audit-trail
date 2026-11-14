@@ -3,7 +3,7 @@ import type { Payload } from 'payload'
 import { entryHash, SEAL_KEY, sealDigest, valuesHash } from '../src/chain.js'
 
 /**
- * The verify this plugin shipped before it streamed (K33), kept as a reference: it reads the whole trail into
+ * The verify this plugin shipped before it streamed, kept as a reference: it reads the whole trail into
  * memory. The streaming verify must give the same answer on every trail these tests build. It is word for word
  * the old one except for two rules that changed for both: a seal whose predecessor is gone must be pinned by a
  * checkpoint (a second prune used to leave a false break), and a seal head with no seals is a break.

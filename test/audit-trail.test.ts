@@ -17,7 +17,7 @@ let admin: U
 let member: U
 let via: 'none' | 'hats' = 'none'
 
-// `emailChange` is hidden and `twoStep` can't be read, so the saved copy leaves both out (the site's K428 case).
+// `emailChange` is hidden and `twoStep` can't be read, so the saved copy leaves both out (the site's case).
 const users: CollectionConfig = {
   slug: 'users',
   auth: true,
@@ -155,7 +155,7 @@ describe('what it records', () => {
     expect((await latestFor(e.id)).changedFields).not.toContain('mates')
   })
 
-  it('records a delete, with no fields (K30)', async () => {
+  it('records a delete, with no fields', async () => {
     const e = await newEntry({ notes: 'going' })
     await payload.delete({ collection: 'studbook-entries', id: e.id, ...(await as(admin)) })
     expect(await latestFor(e.id)).toMatchObject({ action: 'delete', actor: admin.id, changedFields: [] })
@@ -219,7 +219,7 @@ describe('the value log', () => {
     await expect(cfg({ ...base, values: { users: ['email'] } })).rejects.toThrow(/sign-in/)
   })
 
-  it('refuses the rest of its startup cases too (K30)', async () => {
+  it('refuses the rest of its startup cases too', async () => {
     const kits: CollectionConfig = {
       slug: 'kits',
       fields: [
@@ -364,7 +364,7 @@ const logsDuring = async (fn: () => Promise<unknown>) => {
 const contextText = (req: PayloadRequest) => JSON.stringify(req.context, (_k, v) => (v instanceof Map ? [...v.entries()] : v instanceof Set ? [...v] : v))
 const accountUpdates = async (id: string) => events({ and: [{ subjectCollection: { equals: 'users' } }, { subjectId: { equals: id } }, { action: { equals: 'update' } }] })
 
-describe('accounts: passwords and fields the saved copy leaves out (ported from the site, K428)', () => {
+describe('accounts: passwords and fields the saved copy leaves out (ported from the site)', () => {
   const PASSWORD = 'Made-up-new-password-4821'
   let person: U
   beforeAll(async () => {
@@ -539,7 +539,7 @@ describe('stored changes the saved copy can’t show (security read of ef35392)'
   })
 })
 
-describe('per-write state (the site lead’s audit, PR #117)', () => {
+describe('per-write state (the first site’s audit, PR #117)', () => {
   it('two concurrent writes sharing one context object each record their own fields', async () => {
     const shared = {}
     const [a, b] = (await Promise.all([

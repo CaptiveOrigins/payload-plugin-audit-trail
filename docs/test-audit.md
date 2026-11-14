@@ -1,54 +1,54 @@
 # Test audit
 
-## 2026-11-10: full self-audit (K30)
+## 2026-11-10: full self-audit
 
-Every promise in the README, docs/decisions.md and ADR 0001, against the tests at b7a70e8 plus the ones added here (marked K30). Baseline: 38 tests. Now: 52.
+Every promise in the README, docs/decisions.md and ADR 0001, against the tests at b7a70e8 plus the ones added here. Baseline: 38 tests. Now: 52.
 
 | Promise | Test |
 | --- | --- |
 | Field names only, never values; nothing for a no-op update | audit-trail: "names the fields that changed…" |
 | Create and update recorded | the same, and chain: "links each record's entries…" |
-| Delete recorded, with no fields | audit-trail: "records a delete, with no fields (K30)" |
+| Delete recorded, with no fields | audit-trail: "records a delete, with no fields" |
 | Sign-in internals, timestamps and join fields never listed | "never lists sign-in internals…" |
 | `audit: false` skips; origin, system, reason land | "skips bookkeeping writes…" |
 | `via` from the resolver, empty without | "says how the change was made…" |
 | A failed entry undoes the change (`fail`, with transactions) | "a change whose entry can't be written is undone" |
 | No transactions: refuses to start unless `log` | "won't start without transactions…" |
 | Value log: named fields only, people only in `allowPeople`, capped at 2 KB | "keeps old and new values…" |
-| Startup refusals: hidden, `admin.hidden`, read access, secret, encrypted, personal (by name and as `collection.field`), people links (single and polymorphic), inside an array, sign-in fields (`email`, `password`, `hash`), a missing field | "refuses at startup to log…" and "refuses the rest of its startup cases too (K30)" |
-| Startup refusals: `values` naming a missing collection or one not in `collections`, `collections` naming a missing collection, a slug clash | "refuses the rest of its startup cases too (K30)" |
-| Nobody reads the trail by default | chain: "nobody reads it by default… (K30)" |
-| Reading the trail isn't reading values (`access.values` defaults to nobody) | the same (K30); "shows values only to access.values…" for the admin side |
-| The trail, heads and seals refuse create, update and delete for everyone; heads and seals refuse reads | the same (K30) |
+| Startup refusals: hidden, `admin.hidden`, read access, secret, encrypted, personal (by name and as `collection.field`), people links (single and polymorphic), inside an array, sign-in fields (`email`, `password`, `hash`), a missing field | "refuses at startup to log…" and "refuses the rest of its startup cases too" |
+| Startup refusals: `values` naming a missing collection or one not in `collections`, `collections` naming a missing collection, a slug clash | "refuses the rest of its startup cases too" |
+| Nobody reads the trail by default | chain: "nobody reads it by default…" |
+| Reading the trail isn't reading values (`access.values` defaults to nobody) | the same; "shows values only to access.values…" for the admin side |
+| The trail, heads and seals refuse create, update and delete for everyone; heads and seals refuse reads | the same |
 | Drafts: autosave not recorded, publish and save are, restore recorded with its reason | "records publishing and saving…" |
 | Autosave can't hide a change (no drafts, `draft: false`, other records changed by hooks) | "autosave can't hide a change" (both tests) |
 | Sink: named events, unknown actions refused, mapper errors fail unless `log` | "records named events…" |
-| Events outside a request open their own transaction, so a failed entry leaves the head alone | chain: "events recorded outside a request… (K30)" |
+| Events outside a request open their own transaction, so a failed entry leaves the head alone | chain: "events recorded outside a request…" |
 | No fork under 40 changes at once and 10 on one record | chain: "doesn't fork…" |
 | Two seals at once don't fork | "two seals at once…" |
 | Seals refuse the grace; overdue entries warn | "refuses to reach closer than the grace…" |
-| `onSeal` gets each digest as stored, and the checkpoint too | "a seal's digest edited…" and "a checkpoint moved later…" (K30) |
+| `onSeal` gets each digest as stored, and the checkpoint too | "a seal's digest edited…" and "a checkpoint moved later…" |
 | Tampering: an entry edited | "an entry changed in the database" |
-| Tampering: a site field (`extraFields`) or the stored hash edited | "a site field (extraFields) or the stored hash edited" (K30) |
+| Tampering: a site field (`extraFields`) or the stored hash edited | "a site field (extraFields) or the stored hash edited" |
 | Tampering: the newest entry deleted before a seal | "the newest entry deleted…" |
 | Tampering: a middle entry deleted, or a forged one put back | "an entry in the middle deleted…" |
-| Tampering: an entry relinked, hash recomputed | "an entry relinked…" (K30) |
-| Tampering: a first entry made to link to something | "a first entry made to link…" (K30) |
-| Tampering: a whole chain deleted before a seal, head kept; a head deleted, chain kept | "a record's whole chain deleted before a seal…" (K30) |
+| Tampering: an entry relinked, hash recomputed | "an entry relinked…" |
+| Tampering: a first entry made to link to something | "a first entry made to link…" |
+| Tampering: a whole chain deleted before a seal, head kept; a head deleted, chain kept | "a record's whole chain deleted before a seal…" |
 | Tampering: a whole chain and its head deleted after a seal | "a whole record's chain deleted, head and all, after a seal" |
-| Tampering: a well-formed entry, with its own chain and head, added in a sealed range | "a well-formed entry… slipped into a sealed range" (K30) |
-| Tampering: a seal's digest edited, the newest seal deleted, a middle seal deleted | "a seal's digest edited…" (K30) |
-| Tampering: a checkpoint moved later | "a checkpoint moved later…" (K30) |
+| Tampering: a well-formed entry, with its own chain and head, added in a sealed range | "a well-formed entry… slipped into a sealed range" |
+| Tampering: a seal's digest edited, the newest seal deleted, a middle seal deleted | "a seal's digest edited…" |
+| Tampering: a checkpoint moved later | "a checkpoint moved later…" |
 | Tampering: values edited; clearing them keeps the chain whole | "logged values changed…" |
 | Tampering: the first entry after a prune deleted | "pruning cuts at a seal's end…" |
-| `since` still checks links and heads | "with `since`, links and heads are still checked…" (K30) |
+| `since` still checks links and heads | "with `since`, links and heads are still checked…" |
 | Retention: nothing without arguments; values cleared; entries cut only at a seal's end with a checkpoint | "clears old values and deletes…", "pruning cuts at a seal's end…" |
-| Retention: nothing deleted with no seal yet | "deletes nothing with no seal yet…" (K30) |
-| Retention: entries after the last seal's end kept, even when older than asked | "keeps entries after the last seal's end…" (K30) |
+| Retention: nothing deleted with no seal yet | "deletes nothing with no seal yet…" |
+| Retention: entries after the last seal's end kept, even when older than asked | "keeps entries after the last seal's end…" |
 | Hash stable on read back; missing equals null; extra fields added later | "the hash itself" |
-| Adoption (the whole section) | adopt.test.ts, mapped in the K26 section below |
+| Adoption (the whole section) | adopt.test.ts, mapped in the adoption section below |
 
-**Gaps added (K30), 14 tests:** the tamper cases verify names but no test reached (a relinked entry, a first entry that links, an edited site field or hash, a chain without entries or without a head, an entry slipped into a sealed range, an edited or missing seal, a moved checkpoint, `since`); append-only access on all three collections and the default read and values access; prune with no seal, and prune keeping entries newer than the cut; a delete; the rest of the startup refusals; an event outside a request rolling back its head.
+**Gaps added, 14 tests:** the tamper cases verify names but no test reached (a relinked entry, a first entry that links, an edited site field or hash, a chain without entries or without a head, an entry slipped into a sealed range, an edited or missing seal, a moved checkpoint, `since`); append-only access on all three collections and the default read and values access; prune with no seal, and prune keeping entries newer than the cut; a delete; the rest of the startup refusals; an event outside a request rolling back its head.
 
 **Mutation check.** Each guard below was broken by a string replace in `src/index.ts`, the matching test file run, and the file restored. Every one made a test fail:
 
@@ -119,7 +119,7 @@ Each promise in the README and ADR 0001, and the test that proves it:
 
 Gaps, skipped with reason: Postgres (not supported in 0.1, said in Limits); a verify over a very large trail (`since` exists, a scale test belongs to the site).
 
-## 2026-11-10: adopting a log kept before the plugin (K26)
+## 2026-11-10: adopting a log kept before the plugin
 
 | Promise | Test |
 | --- | --- |
@@ -150,7 +150,7 @@ Gaps added: thirteen tests in all; the last two after the second read (b104d3b);
 
 ## 2026-11-11: passwords, unreadable fields and events without a request
 
-From the first site's own trail (K428, its tests ported) and the combo test with MFA, Hats and Masq (branch `combo-tests`). Baseline 56 tests, now 64 on main.
+From the first site's own trail (its tests ported) and the combo test with MFA, Hats and Masq (branch `combo-tests`). Baseline 56 tests, now 64 on main.
 
 | Promise | Test |
 | --- | --- |
@@ -167,7 +167,7 @@ From the first site's own trail (K428, its tests ported) and the combo test with
 
 Mutation-checked: each guard removed fails at least one of these tests (see the commit message). Gaps skipped: a password set by a bulk `update` with `where` is covered by the same code path as an update by id (keyed `collection:*`) and isn't tested separately.
 
-## 2026-11-11: after the security read of ef35392 and the site lead's audit (PR #117)
+## 2026-11-11: after the security read of ef35392 and the first site's audit (PR #117)
 
 Now 72 tests on main. Each new test below failed on ef35392 first, except two kept as guards (marked).
 
@@ -205,7 +205,7 @@ The two reset guards that survived the last mutation check were redundant with a
 
 After the third read (approved f8cdfb4), 79 tests: "two nested writes to one record each use their own reading…" (fails if the oldest reading is taken instead of the newest, the mutation that survived before) and "forgets a failed reset's reading…" (failed first). The sign-in clear removed in f8cdfb4 is back, now with a test that isolates it. Known and stated in the README: an outer entry may also list a hidden field or password a nested inner write changed.
 
-## 2026-11-11: verify a page at a time (K33)
+## 2026-11-11: verify a page at a time
 
 Baseline 79 tests, now 110: 31 in `test/verify-stream.test.ts` (22 for streaming, 5 for the prune fix and 4 for the security read's shoulds, both below), on the same in-memory MongoDB replica set. `test/legacy-verify.ts` is the old verify, word for word; "agrees" below means the streaming verify's `ok`, `checked`, `firstBreak` and `warnings` equal its answer at page sizes 1, 2, 3 and 1,000.
 
@@ -271,7 +271,7 @@ Two guards survived the first pass and were removed as redundant, each already c
 1. **A second prune left verify reporting a break that wasn't one.** Fixed in the next section.
 2. `sealAuditTrail` still reads one interval's entries at once, and `adoptExistingEntries` the whole old log in one transaction.
 
-## 2026-11-11: pruning more than once (K33, second pass)
+## 2026-11-11: pruning more than once (second pass)
 
 The three tests in "pruning more than once" were written first and failed on 6a71c03: the first two on the false break, the third because removing a trail's first seal with its entries passed verify. `test/legacy-verify.ts` carries the same new link rule, so the two verifies are still compared.
 
@@ -293,7 +293,7 @@ The three tests in "pruning more than once" were written first and failed on 6a7
 - A trail pruned by a build from before this change: it reports a link break by design; nothing was published with that format.
 - A prune racing a seal: the checkpoint is written with the conditional seal head, as before ("two seals at once…").
 
-## 2026-11-11: the security read of 8a3bebb (K33, third pass)
+## 2026-11-11: the security read of 8a3bebb (third pass)
 
 Four tests in "after the security read of 8a3bebb", each written first and failing on 8a3bebb. 110 tests in all.
 

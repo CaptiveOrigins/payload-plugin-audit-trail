@@ -1,6 +1,6 @@
 # ADR 0001: Audit trail for Payload, the design
 
-Status: proposed, 2026-11-10. Lead: Plugin Security. Independent pre-publish security read: Platform, cleared for the first public push at `2670bb8` (2026-11-10). Approved as an agnostic plugin by the owner, 2026-11-10 (relayed by Helm).
+Status: proposed, 2026-11-10. Independent pre-publish security read: cleared for the first public push at `2670bb8` (2026-11-10). Approved as an agnostic plugin by the owner, 2026-11-10.
 
 ## Context
 
@@ -80,9 +80,9 @@ Which collections and fields; the `personal` list; `via` resolution (masq, Hats,
 
 - Recording field paths inside groups (`address.city`) rather than the group's name: left for 0.2. 0.1 keeps the site's current top-level behavior.
 
-## Changes after Platform's pre-publish read (2026-11-10)
+## Changes after the pre-publish read (2026-11-10)
 
-Platform read this ADR at `d3f2c8b`. Each point, and what changed:
+The reviewer read this ADR at `d3f2c8b`. Each point, and what changed:
 
 1. **Must: failing closed needs transactions.** Done in decision 3: a startup check, refusing without transactions unless `onWriteError: 'log'` is explicit. Tests: with transactions, a failed entry rolls back the change; without them, startup refuses, and with `'log'` it starts and logs.
 2. **Must: `fromPluginEvent` when the mapper throws or returns an unknown action.** Done in decision 6: it throws by default, and `onError: 'log'` is the explicit opt-out. Tests for both cases.
@@ -92,11 +92,11 @@ Platform read this ADR at `d3f2c8b`. Each point, and what changed:
 6. **Should: index `at` alone.** Done in decision 8.
 7. **Note.** The README says `context.audit.reason` is free text a developer writes and must never carry values; the plugin never fills it from data.
 
-Not changed: append-only access and the startup refusals. Platform agreed both are right.
+Not changed: append-only access and the startup refusals. The reviewer agreed both are right.
 
 ## Addendum: a tamper-evident trail (2026-11-10)
 
-The owner chose a hash-chained, tamper-evident trail (relayed by Platform, 2026-11-10; the exact words go in `docs/decisions.md` once Platform sends them). Platform listed five points to design in first, since the two-step races came from the same read-then-write pattern. The decisions:
+The owner chose a hash-chained, tamper-evident trail (2026-11-10; see `docs/decisions.md`). The reviewer listed five points to design in first, since the two-step races came from the same read-then-write pattern. The decisions:
 
 10. **Chains per record, sealed daily across the site.**
     - Each entry joins the chain of its subject (`collection:id`). A small `audit-heads` document per subject holds that chain's last hash and a sequence number. The entry is written and the head moved in **one conditional update**, matched on the previous hash, **inside the change's own transaction**. If the head moved meanwhile, the plugin reads it again and retries a few times.
@@ -120,14 +120,14 @@ The owner chose a hash-chained, tamper-evident trail (relayed by Platform, 2026-
 
 Choices left as stated: SHA-256, hex. `audit-heads` and seals are append-only (access false; only the plugin writes). With `onWriteError: 'log'`, a failed entry also leaves its chain untouched.
 
-15. **Platform's additions to the chain (2026-11-10).**
+15. **The reviewer's additions to the chain (2026-11-10).**
     - **Heads are checked:** verify compares each `audit-heads` document with the last entry of its chain (hash and sequence). Deleting the newest entry, or a subject's whole chain, shows even before it's sealed.
     - **A change is fully protected once sealed.** The README says so. The seal interval is an option (`sealEveryHours`, default 24; hourly suits a busy site).
     - **Seals can't fork:** two seals run at once update a seal head conditionally, as entries do. The loser does nothing. Tested.
     - **Seals refuse the future:** `upTo` must be at least the grace before now. Verify reports entries unsealed for longer than an interval as a **warning**, not a break.
     - **extraFields hash by name,** and a missing or null value hashes as missing, so adding an extra field later doesn't change old hashes.
 
-## Changes after Platform's read of `21b195e` (2026-11-10)
+## Changes after the reviewer's read of `21b195e` (2026-11-10)
 
 - **Blocker: autosave could hide a real change.** The skip now applies only when the collection autosaves drafts, the call is `draft: true` and `autosave: true`, and it names a record; it's keyed to that record, so hooks changing other records during it are recorded. Restores are keyed the same way.
 - **Entries outside a request transaction** open their own, so the entry and the head move together.

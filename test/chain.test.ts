@@ -197,7 +197,7 @@ describe('the hash itself', () => {
   })
 })
 
-// Added by the full self-audit (K30, 2026-11-10): each break verify claims to report, and the guards around it.
+// Added by the full self-audit (2026-11-10): each break verify claims to report, and the guards around it.
 /** Rewrites an entry with a new hash that matches its new content, as someone who knows the hash rule would. */
 const rehash = (e: Record<string, any>, change: Record<string, unknown>) => {
   const next = { ...e, ...change }

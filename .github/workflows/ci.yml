@@ -7,7 +7,7 @@ on:
     paths-ignore: ['**.md', 'docs/**']
 permissions:
   contents: read
-# Actions minutes rules (ops/rules/actions-minutes.md, 2026-11-10): one run per change, drafts skipped, a timeout.
+# Actions minutes rules (2026-11-10): one run per change, drafts skipped, a timeout.
 # The leak check runs in its own workflow (leak-check.yml) on every change, docs included.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

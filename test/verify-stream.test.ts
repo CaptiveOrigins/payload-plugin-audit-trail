@@ -8,7 +8,7 @@ import { adoptExistingEntries, auditTrail, pruneAuditTrail, sealAuditTrail, veri
 import { legacyVerify } from './legacy-verify.js'
 
 /**
- * Verify reads the trail a page at a time (K33). These tests hold it to the answer the old, read-it-all verify
+ * Verify reads the trail a page at a time. These tests hold it to the answer the old, read-it-all verify
  * gave, on a made-up site whose trail is emptied before each test.
  */
 type Doc = Record<string, any> // eslint-disable-line @typescript-eslint/no-explicit-any
