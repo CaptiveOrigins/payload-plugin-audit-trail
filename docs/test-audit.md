@@ -150,7 +150,7 @@ Gaps added: thirteen tests in all; the last two after the second read (b104d3b);
 
 ## 2026-11-11: passwords, unreadable fields and events without a request
 
-From the Captive Origins site's own trail (K428, its tests ported) and the combo test with MFA, Hats and Masq (branch `combo-tests`). Baseline 56 tests, now 64 on main.
+From the first site's own trail (K428, its tests ported) and the combo test with MFA, Hats and Masq (branch `combo-tests`). Baseline 56 tests, now 64 on main.
 
 | Promise | Test |
 | --- | --- |

@@ -1,6 +1,6 @@
 # payload-plugin-audit-trail
 
-Registered in the owner's ops process (`~/Code/ops`). Area: `captive-origins`. Created 2026-11-10 from the ops starter kit.
+Registered in the owner's ops process (`~/Code/ops`). Area: `plugins`. Created 2026-11-10 from the ops starter kit.
 
 **Before doing anything here, run `~/Code/ops/scripts/repo-context`.** It shows who leads this repo, whether that session is active, what's pending, and which briefs apply. If it says the repo has no active owner, tell the director ("Helm") before starting work.
 
