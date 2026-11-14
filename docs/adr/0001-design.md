@@ -6,7 +6,7 @@ Status: proposed, 2026-11-10. Independent pre-publish security read: cleared for
 
 The first site keeps an append-only `audit-events` collection, written by a site plugin (`src/plugins/auditTrail.ts`). It records who changed which fields of which record, from where (manual, web, import, sync, job…), and **never the values**, so the trail can't leak what it records. Every newer plugin (Hats, age gate, Whitehat, account controls) hands its `onEvent` to the site, which writes `audit-events` by hand.
 
-Under `rules/build-it-right.md`, this becomes its own plugin. Two owner decisions from 2026-11-10 shape it:
+Following the rule that reusable pieces become their own plugins, this is one. Two owner decisions from 2026-11-10 shape it:
 - a **studbook exception**: an opt-in log of old values for named fields, but "never people's personal details";
 - a **"via"**, saying whether a change was made from the person's own account, through Hats, by a guardian or while masquerading, for the coming guardians plugin.
 
